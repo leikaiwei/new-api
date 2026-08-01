@@ -1,0 +1,135 @@
+# fork 专用：发布 release 时把镜像构建并推到 GHCR。
+# 上游那套 docker-build.yml 推的是 Docker Hub calciumion/new-api，我们不用它（见仓库外的 run-book）。
+# 本文件是 fork 新增文件，不修改上游任何文件，所以 merge upstream 时不会冲突。
+name: Build & push image to GHCR (fork)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要构建的 git tag（必须已存在）'
+        required: true
+        type: string
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/new-api
+
+jobs:
+  build:
+    name: 构建并推送 (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      latest: ${{ steps.ver.outputs.latest }}
+
+    steps:
+      # release 事件取 release 的 tag，手动触发取输入值
+      - name: 解析 tag
+        id: ver
+        run: |
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            echo "::error::未能解析出 tag"
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          # 只有正式 release 才移动 latest；预发布（rc/alpha/beta）与手动构建都不动
+          if [ "${{ github.event.release.prerelease }}" = "false" ]; then
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "构建 tag ${TAG}（${{ matrix.arch }}）"
+
+      - name: 签出
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ steps.ver.outputs.tag }}
+
+      # 仓库里 VERSION 是空文件，Dockerfile 用它注入前端版本号与 Go ldflags，必须先写
+      - name: 写入 VERSION
+        run: echo "${{ steps.ver.outputs.tag }}" > VERSION
+
+      - name: 准备 Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: 登录 GHCR
+        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 先推带 arch 后缀的单架构镜像，下一个 job 再合成多架构 manifest
+      # provenance/sbom 关掉：开着会往 arch tag 里塞 unknown/unknown 条目，污染合成出的 manifest list
+      - name: 构建并推送
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.ver.outputs.tag }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          provenance: false
+          sbom: false
+
+  manifest:
+    name: 合成多架构 manifest
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      packages: write
+
+    steps:
+      - name: 登录 GHCR
+        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 合成并推送 manifest
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+          MOVE_LATEST: ${{ needs.build.outputs.latest }}
+        run: |
+          set -euo pipefail
+          TAGS=("${TAG}")
+          [ "${MOVE_LATEST}" = "true" ] && TAGS+=(latest)
+          for t in "${TAGS[@]}"; do
+            echo "推送 ${IMAGE}:${t}"
+            docker buildx imagetools create -t "${IMAGE}:${t}" \
+              "${IMAGE}:${TAG}-amd64" \
+              "${IMAGE}:${TAG}-arm64"
+          done
+
+      - name: 结果摘要
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          {
+            echo "### 镜像已推送"
+            echo '```'
+            echo "${IMAGE}:${TAG}"
+            docker buildx imagetools inspect "${IMAGE}:${TAG}"
+            echo '```'
+            echo "生产部署请钉具体 tag，不要用 latest。"
+          } >> "$GITHUB_STEP_SUMMARY"
