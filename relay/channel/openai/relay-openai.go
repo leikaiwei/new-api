@@ -118,6 +118,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	var toolCount int
 	var usage = &dto.Usage{}
 	var lastStreamData string
+	var lastUsageStreamData string  // 最后一个带有效 usage 的 stream data，避免被上游追加的非标准元数据帧覆盖
 	var secondLastStreamData string // 存储倒数第二个stream data，用于音频模型
 	seenStreamToolCalls := make(map[string]struct{})
 	var streamFunctionCallNames []string
@@ -139,6 +140,11 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 			}
 
 			lastStreamData = data
+			// 部分上游（如 opencode zen/go）在 usage 帧之后还会追加自有元数据帧，
+			// 只看最后一帧会丢掉真实 usage 并回退本地估算，故单独记住最后一个带 usage 的帧。
+			if streamDataHasBillableUsage(data) {
+				lastUsageStreamData = data
+			}
 			collectStreamFunctionCallNames(data, seenStreamToolCalls, &streamFunctionCallNames)
 			if err := processTokenData(info.RelayMode, data, &responseTextBuilder, &toolCount); err != nil {
 				logger.LogError(c, "error processing stream token data: "+err.Error())
@@ -172,6 +178,19 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		logger.LogError(c, fmt.Sprintf("error handling last response: %s, lastStreamData: [%s]", err.Error(), lastStreamData))
 	}
 
+	// 末帧是上游追加的元数据帧时，从记录的 usage 帧补回真实用量与响应元数据。
+	// 末帧是否转发给客户端的判定沿用上面的结果，避免改变客户端可见的流内容。
+	usageStreamData := lastStreamData
+	if !containStreamUsage && lastUsageStreamData != "" {
+		keepSendLastResp := shouldSendLastResp
+		if err := handleLastResponse(lastUsageStreamData, &responseId, &createAt, &systemFingerprint, &model, &usage,
+			&containStreamUsage, info, &keepSendLastResp); err != nil {
+			logger.LogError(c, fmt.Sprintf("error handling last usage response: %s, lastUsageStreamData: [%s]", err.Error(), lastUsageStreamData))
+		} else {
+			usageStreamData = lastUsageStreamData
+		}
+	}
+
 	if info.RelayFormat == types.RelayFormatOpenAI {
 		if shouldSendLastResp {
 			_ = sendStreamData(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
@@ -183,7 +202,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		usage.CompletionTokens += toolCount * 7
 	}
 
-	applyUsagePostProcessing(info, usage, common.StringToByteSlice(lastStreamData))
+	applyUsagePostProcessing(info, usage, common.StringToByteSlice(usageStreamData))
 
 	for _, name := range streamFunctionCallNames {
 		info.CountBillableToolCall(dto.BuildInCallFunctionCall, name)
@@ -192,6 +211,19 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	HandleFinalResponse(c, info, lastStreamData, responseId, createAt, model, systemFingerprint, usage, containStreamUsage)
 
 	return usage, nil
+}
+
+// streamDataHasBillableUsage 判断该 SSE 帧是否携带可用于计费的上游 usage。
+// 先用子串快速排除绝大多数增量帧，避免逐帧全量反序列化（单请求可达数千帧）。
+func streamDataHasBillableUsage(data string) bool {
+	if !strings.Contains(data, `"usage"`) {
+		return false
+	}
+	var streamResponse dto.ChatCompletionsStreamResponse
+	if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
+		return false
+	}
+	return service.ValidUsage(streamResponse.Usage)
 }
 
 func collectStreamFunctionCallNames(data string, seen map[string]struct{}, names *[]string) {
