@@ -117,7 +117,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	var toolCount int
 	var usage = &dto.Usage{}
 	var lastStreamData string
-	var secondLastStreamData string // 保留倒数第二个stream data；部分兼容网关把完整usage放在倒数第二个事件
+	var lastUsageStreamData string // 最后一个带有效 usage 的 stream data，避免被上游追加的非标准元数据帧覆盖
 	seenStreamToolCalls := make(map[string]struct{})
 	var streamFunctionCallNames []string
 
@@ -129,11 +129,12 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 			}
 		}
 		if len(data) > 0 {
-			if lastStreamData != "" {
-				secondLastStreamData = lastStreamData
-			}
-
 			lastStreamData = data
+			// 部分上游（如 opencode zen/go）在 usage 帧之后还会追加自有元数据帧，
+			// 只看最后一帧会丢掉真实 usage 并回退本地估算，故单独记住最后一个带 usage 的帧。
+			if streamDataHasBillableUsage(data) {
+				lastUsageStreamData = data
+			}
 			collectStreamFunctionCallNames(data, seenStreamToolCalls, &streamFunctionCallNames)
 			if err := processTokenData(info.RelayMode, data, &responseTextBuilder, &toolCount); err != nil {
 				logger.LogError(c, "error processing stream token data: "+err.Error())
@@ -149,23 +150,19 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		logger.LogError(c, fmt.Sprintf("error handling last response: %s, lastStreamData: [%s]", err.Error(), lastStreamData))
 	}
 
-	// 部分兼容网关把完整的累计usage附在倒数第二个事件上，随后发送一个空的最后事件。
-	// 仅当最后一个事件没有有效usage时，回退到倒数第二个事件的完整快照。
+	// 末帧是上游追加的元数据帧时，从记录的 usage 帧补回真实用量与响应元数据。
+	// 记录的是最后一个带有效 usage 的帧而非固定的倒数第二帧，上游追加多个元数据帧时同样成立。
+	// 末帧是否转发给客户端的判定沿用上面的结果，避免改变客户端可见的流内容。
 	usageFrame := lastStreamData
-	if !containStreamUsage && secondLastStreamData != "" {
-		var streamResp struct {
-			Usage *dto.Usage `json:"usage"`
-		}
-		err := common.Unmarshal([]byte(secondLastStreamData), &streamResp)
-		if err == nil && streamResp.Usage != nil &&
-			streamResp.Usage.PromptTokens > 0 &&
-			(streamResp.Usage.CompletionTokens > 0 || streamResp.Usage.TotalTokens > 0) {
-			usage = dto.MergeUsageNonZero(usage, streamResp.Usage)
-			containStreamUsage = true
-			usageFrame = secondLastStreamData
-
+	if !containStreamUsage && lastUsageStreamData != "" {
+		keepSendLastResp := shouldSendLastResp
+		if err := handleLastResponse(lastUsageStreamData, &responseId, &createAt, &systemFingerprint, &model, &usage,
+			&containStreamUsage, info, &keepSendLastResp); err != nil {
+			logger.LogError(c, fmt.Sprintf("error handling last usage response: %s, lastUsageStreamData: [%s]", err.Error(), lastUsageStreamData))
+		} else {
+			usageFrame = lastUsageStreamData
 			if common.DebugEnabled {
-				logger.LogDebug(c, "usage extracted from second last SSE: PromptTokens=%d, CompletionTokens=%d, TotalTokens=%d, InputTokens=%d, OutputTokens=%d",
+				logger.LogDebug(c, "usage extracted from earlier SSE frame: PromptTokens=%d, CompletionTokens=%d, TotalTokens=%d, InputTokens=%d, OutputTokens=%d",
 					usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens,
 					usage.InputTokens, usage.OutputTokens)
 			}
@@ -192,6 +189,19 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	HandleFinalResponse(c, info, lastStreamData, responseId, createAt, model, systemFingerprint, usage, containStreamUsage)
 
 	return usage, nil
+}
+
+// streamDataHasBillableUsage 判断该 SSE 帧是否携带可用于计费的上游 usage。
+// 先用子串快速排除绝大多数增量帧，避免逐帧全量反序列化（单请求可达数千帧）。
+func streamDataHasBillableUsage(data string) bool {
+	if !strings.Contains(data, `"usage"`) {
+		return false
+	}
+	var streamResponse dto.ChatCompletionsStreamResponse
+	if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
+		return false
+	}
+	return service.ValidUsage(streamResponse.Usage)
 }
 
 func collectStreamFunctionCallNames(data string, seen map[string]struct{}, names *[]string) {
