@@ -1,3 +1,24 @@
+# New API (Fork)
+
+Fork 自 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)，在上游基础上打了以下补丁：
+
+**#1 流式响应的上游 usage 被追加帧覆盖，导致 token 记账归零** — `relay/channel/openai/relay-openai.go`
+
+- 症状：Anthropic 入口（`/v1/messages`）+ OpenAI 兼容渠道 + 流式这个组合下，日志里 output token 与 cache token 恒为 0。生产实测 454/454 条流式请求全为 0，而同渠道非流式 239/239 正常，同入口走另一个上游端点也正常
+- 根因：`OaiStreamHandler` 逐帧无差别覆盖 `lastStreamData`，收尾只解析这最后一帧找 usage。部分上游在带 usage 的帧**之后**还会追加自有元数据帧（实测 opencode `zen/go` 端点发 `{"choices":[],"x-opencode-type":"inference-cost","cost":"...","normalizedUsage":{...}}`，而免费的 `zen` 端点不发此帧因而不受影响），于是"最后一帧"落在无 usage 的帧上，`containStreamUsage` 为 false，上游真实 usage 被整份丢弃、回退本地估算 `ResponseText2Usage`
+- 为何恰好是 0 而非偏小值：`/v1/messages` 这条路的 `RelayMode` 是 `Unknown`（`Path2RelayMode` 无该分支，`GenRelayInfoClaude` 也未设），逐帧回调 `processTokenData` 的 switch 不匹配，`responseTextBuilder` 全程为空，估算结果精确为 0。同一 bug 在 `/v1/chat/completions` 上则表现为 output 偏差 + cache 恒 0
+- 修复：额外记住最后一个带有效 usage 的帧；末帧不含 usage 时从它补回真实用量，以及被元数据帧清空的 `id` / `model` / `system_fingerprint`。`applyUsagePostProcessing` 的 body 参数一并改用该帧，使 DeepSeek / 智谱 / Moonshot 这类需从 body 二次提取 `cached_tokens` 的渠道同样受益（上游 PR #6328 缺的正是这块）。客户端可见的 SSE 内容不变
+- 影响面：token 是限流、配额与用量分析的依据。当前该模型免费（`ModelRatio: 0`）故无计费损失，但这条路径结构上必然少记 output，若放付费模型会**少计费**
+- 上游状态：[#6272](https://github.com/QuantumNous/new-api/issues/6272) open 无人处理，[#6158](https://github.com/QuantumNous/new-api/issues/6158) / [#6500](https://github.com/QuantumNous/new-api/issues/6500) 被 bot 自动判重关成 `not_planned`，三者均无人类维护者回应；[PR #6070](https://github.com/QuantumNous/new-api/pull/6070) 停滞且有冲突，[PR #6328](https://github.com/QuantumNous/new-api/pull/6328) 被作者自行关闭。上游合并后本地补丁可移除
+- 已知遗留（本轮未修）：`Path2RelayMode` 缺 `/v1/messages` 分支这个缺陷本身仍在。补丁 #1 生效后走的是上游真实 usage，本地估算那条死路不会被触达，故无需修；且维护者在 [PR #3340](https://github.com/QuantumNous/new-api/pull/3340) 明确拒绝过在此处加分支，要求各渠道 adaptor 自行适配
+
+**CI：fork 专用 GHCR 镜像构建** — `.github/workflows/fork-ghcr-release.yml`
+
+- 发布 release 时自动构建 amd64 + arm64 推送到 `ghcr.io/leikaiwei/new-api`，不走 Docker Hub
+- 触发条件是 release published 而非 push tag，避免同步上游时几十个 tag 批量触发构建
+
+---
+
 <div align="center">
 
 ![new-api](/web/public/logo.png)
