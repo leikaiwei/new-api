@@ -16,11 +16,14 @@ Fork 自 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)，在上�
 
 - 症状：Claude Code → LiteLLM（Anthropic 风格）→ new-api → OpenAI 风格上游 这条链上，渠道参数覆盖里带 `keep_origin: true` 的 `set thinking` 操作恒生效，客户端已开启思考的请求也被强制关闭；同时条件里引用 `thinking.type` 的操作永不命中
 - 根因：`/v1/messages` 走 `ClaudeHelper`，先 `ConvertClaudeRequest` 转成 OpenAI 格式、**之后**才应用参数覆盖（`relay/claude_handler.go`）。而 Claude→OpenAI 转换器仅在 OpenRouter 方言下处理 `thinking`（映射为 `reasoning`），普通 OpenAI 渠道该字段被直接丢弃。等覆盖执行时 `thinking` 已不存在，`keep_origin` 的"字段已存在则跳过"判断恒为 false
-- 为何客户端意图不可恢复：Claude Code 关闭思考时只是**不传** `thinking`，不会传 `{"type":"disabled"}`。字段缺失是"下游主动关闭"的唯一信号，而转换后它与"本就没有该字段"无法区分
+- 为何客户端意图不可恢复：`thinking` 是承载该意图的唯一字段（`output_config` 同为 Claude 专有、一并被丢弃），转换后出站请求体里"客户端要思考"与"不要思考"两种情况没有任何字段差异，只能靠转换前的原始请求判断
 - 修复：`BuildParamOverrideContext` 透出 `client_thinking_present`（bool）与 `client_thinking_type`（string）两个只读上下文字段，取自 `info.Request` 中未经改写的下游原始请求（`ClaudeHelper` 先 `DeepCopy` 再改写 thinking，故 `info.Request` 全程保持原始值）。不改动发往上游的请求体；条件求值在请求体找不到路径时会自动回退到上下文
 - 影响面：纯 opt-in。仅引用这两个字段的渠道脚本受影响，未引用的渠道行为完全不变；非 Claude 格式入口不透出该字段
 - 用法：判断"客户端是否**明确要求**思考"，而不是判断字段有无。`client_thinking_type` 不为 `enabled` 且不为 `adaptive`（两条 `invert: true` 条件 + `logic: AND`）时显式关闭上游思考。上游默认开启思考的模型（如 DeepSeek 官方）需要这条才能尊重客户端的关闭意图
-- **别用 `client_thinking_present == false` 判断"客户端关闭了思考"** — 生产实测 Claude Code 关闭思考时会显式传 `thinking:{"type":"disabled"}` 而非省略该字段，此时 `present` 为 true，规则被跳过，字段又被转换器丢弃，上游反而按默认**开启**思考。即客户端越明确说"关"越会思考。`client_thinking_present` 仅适合"区分字段缺失与显式取值"这类场景
+- Claude Code 的真实语义：**开 = 传 `thinking:{"type":"adaptive"}`，关 = 整个字段不传**。`output_config.effort` 是独立的强度档，关闭思考后仍停在上次取值
+- **别用 `client_thinking_present == false` 判断"客户端关闭了思考"** — 中间层可能恒定注入 `thinking`，字段有无不携带信号。生产实测（LiteLLM 1.95.0，`/v1/messages` 入站）：`messages/transformation.py` 的 `_translate_adaptive_effort_for_non_adaptive_model`，闸门是「`output_config.effort` 非空 **或** `thinking.type` 为 `adaptive`」，任一成立即改写，**与 `thinking` 字段是否存在无关**。`deepseek-v4-flash` 的三个能力探针为 False/False/True，落进 legacy 降级分支，`effort` 被造成 `{"type":"enabled","budget_tokens":N}`（high=4096、xhigh=8192）并摘掉 `effort`。因两态 `effort` 相同，出站字节级一致，`present` 恒为 true。即便中间层修正为关闭态发 `disabled`，`present` 在两态下**依然都是 true** —— 判据只能是 `type` 白名单
+- 作用域提醒：同一网关上可能有多个客户端形状。实测另有一路请求原生发 `thinking:{"type":"enabled","budget_tokens":N}` 且不经上述改写，其思考开关从未失效，本规则对它是"跳过"、行为正确 —— 不要假设所有请求都是坏的那个形状
+- 已知局限："开启思考"依赖**上游默认开启**（规则跳过时出站不含 `thinking`），而非显式指令。出站只会写 `disabled` 或不写，`enabled`/`adaptive` 能否被上游接受未验证；若上游某天改默认为关，开启态会静默失效
 - 为何不改转换器：让转换器直接映射 `thinking` 只需几行，但会给**所有** Claude→OpenAI 渠道的上游请求默认加上该字段，不认识它的上游可能 400。改上下文则影响面可控，也更利于长期 rebase 上游
 
 **CI：fork 专用 GHCR 镜像构建** — `.github/workflows/fork-ghcr-release.yml`
