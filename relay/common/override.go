@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/samber/lo"
 	"github.com/tidwall/gjson"
@@ -2099,6 +2100,7 @@ func mergeObjects(data []byte, path string, value interface{}, keepOrigin bool) 
 //   - token_group：令牌指定的分组；未指定时回退为用户分组。
 //   - using_group：当前实际使用的分组，自动跨分组重试时可能变化。
 //   - request_path：请求路径
+//   - client_thinking_present/client_thinking_type：下游原始请求的思考开关。
 //   - is_channel_test：是否为渠道测试请求（同 is_test）。
 func BuildParamOverrideContext(info *RelayInfo) map[string]interface{} {
 	if info == nil {
@@ -2113,6 +2115,17 @@ func BuildParamOverrideContext(info *RelayInfo) map[string]interface{} {
 	if info.ChannelMeta != nil && info.ChannelMeta.UpstreamModelName != "" {
 		ctx["model"] = info.ChannelMeta.UpstreamModelName
 		ctx["upstream_model"] = info.ChannelMeta.UpstreamModelName
+	}
+
+	// 下游原始请求的思考开关。跨格式转换（如 Claude→OpenAI）会丢弃 thinking 字段，
+	// 覆盖脚本无法再从请求体判断客户端是否主动关闭了思考，故在此透出原始意图。
+	if claudeRequest, ok := info.Request.(*dto.ClaudeRequest); ok && claudeRequest != nil {
+		ctx["client_thinking_present"] = claudeRequest.Thinking != nil
+		if claudeRequest.Thinking != nil {
+			ctx["client_thinking_type"] = claudeRequest.Thinking.Type
+		} else {
+			ctx["client_thinking_type"] = ""
+		}
 	}
 	if info.OriginModelName != "" {
 		ctx["original_model"] = info.OriginModelName
