@@ -12,6 +12,16 @@ Fork 自 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)，在上�
 - 上游状态：[#6272](https://github.com/QuantumNous/new-api/issues/6272) open 无人处理，[#6158](https://github.com/QuantumNous/new-api/issues/6158) / [#6500](https://github.com/QuantumNous/new-api/issues/6500) 被 bot 自动判重关成 `not_planned`，三者均无人类维护者回应；[PR #6070](https://github.com/QuantumNous/new-api/pull/6070) 停滞且有冲突，[PR #6328](https://github.com/QuantumNous/new-api/pull/6328) 被作者自行关闭。上游合并后本地补丁可移除
 - 已知遗留（本轮未修）：`Path2RelayMode` 缺 `/v1/messages` 分支这个缺陷本身仍在。补丁 #1 生效后走的是上游真实 usage，本地估算那条死路不会被触达，故无需修；且维护者在 [PR #3340](https://github.com/QuantumNous/new-api/pull/3340) 明确拒绝过在此处加分支，要求各渠道 adaptor 自行适配
 
+**#2 跨格式转换丢弃 thinking，参数覆盖无法识别下游是否主动关闭思考** — `relay/common/override.go`
+
+- 症状：Claude Code → LiteLLM（Anthropic 风格）→ new-api → OpenAI 风格上游 这条链上，渠道参数覆盖里带 `keep_origin: true` 的 `set thinking` 操作恒生效，客户端已开启思考的请求也被强制关闭；同时条件里引用 `thinking.type` 的操作永不命中
+- 根因：`/v1/messages` 走 `ClaudeHelper`，先 `ConvertClaudeRequest` 转成 OpenAI 格式、**之后**才应用参数覆盖（`relay/claude_handler.go`）。而 Claude→OpenAI 转换器仅在 OpenRouter 方言下处理 `thinking`（映射为 `reasoning`），普通 OpenAI 渠道该字段被直接丢弃。等覆盖执行时 `thinking` 已不存在，`keep_origin` 的"字段已存在则跳过"判断恒为 false
+- 为何客户端意图不可恢复：Claude Code 关闭思考时只是**不传** `thinking`，不会传 `{"type":"disabled"}`。字段缺失是"下游主动关闭"的唯一信号，而转换后它与"本就没有该字段"无法区分
+- 修复：`BuildParamOverrideContext` 透出 `client_thinking_present`（bool）与 `client_thinking_type`（string）两个只读上下文字段，取自 `info.Request` 中未经改写的下游原始请求（`ClaudeHelper` 先 `DeepCopy` 再改写 thinking，故 `info.Request` 全程保持原始值）。不改动发往上游的请求体；条件求值在请求体找不到路径时会自动回退到上下文
+- 影响面：纯 opt-in。仅引用这两个字段的渠道脚本受影响，未引用的渠道行为完全不变；非 Claude 格式入口不透出该字段
+- 用法：条件 `client_thinking_present == false` 即"下游主动关闭了思考"，据此显式关闭上游思考。上游默认开启思考的模型（如 DeepSeek 官方）需要这条才能尊重客户端的关闭意图
+- 为何不改转换器：让转换器直接映射 `thinking` 只需几行，但会给**所有** Claude→OpenAI 渠道的上游请求默认加上该字段，不认识它的上游可能 400。改上下文则影响面可控，也更利于长期 rebase 上游
+
 **CI：fork 专用 GHCR 镜像构建** — `.github/workflows/fork-ghcr-release.yml`
 
 - 发布 release 时自动构建 amd64 + arm64 推送到 `ghcr.io/leikaiwei/new-api`，不走 Docker Hub
