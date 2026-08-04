@@ -2315,6 +2315,9 @@ func TestBuildParamOverrideContextClientThinking(t *testing.T) {
 				"mode":  "set",
 				"value": map[string]interface{}{"type": "disabled"},
 				"logic": "AND",
+				// 判断“客户端是否明确要求思考”，而非判断字段有无：
+				// 客户端关闭思考时会显式传 disabled，此时 client_thinking_present 为 true，
+				// 若按 present==false 判断会漏放，字段又被跨格式转换丢弃，上游反而按默认开启思考。
 				"conditions": []interface{}{
 					map[string]interface{}{
 						"path":  "upstream_model",
@@ -2322,9 +2325,16 @@ func TestBuildParamOverrideContextClientThinking(t *testing.T) {
 						"value": "deepseek-v4-flash",
 					},
 					map[string]interface{}{
-						"path":  "client_thinking_present",
-						"mode":  "full",
-						"value": false,
+						"path":   "client_thinking_type",
+						"mode":   "full",
+						"value":  "enabled",
+						"invert": true,
+					},
+					map[string]interface{}{
+						"path":   "client_thinking_type",
+						"mode":   "full",
+						"value":  "adaptive",
+						"invert": true,
 					},
 				},
 			},
@@ -2346,10 +2356,27 @@ func TestBuildParamOverrideContextClientThinking(t *testing.T) {
 			wantBody:    `{"model":"deepseek-v4-flash"}`,
 		},
 		{
+			name:        "客户端要求 enabled 思考则不改动请求体",
+			request:     &dto.ClaudeRequest{Model: "deepseek-v4-flash", Thinking: &dto.Thinking{Type: "enabled", BudgetTokens: lo.ToPtr(1024)}},
+			wantPresent: true,
+			wantType:    "enabled",
+			wantBody:    `{"model":"deepseek-v4-flash"}`,
+		},
+		{
 			name:        "客户端未传 thinking 视为主动关闭，显式关闭上游思考",
 			request:     &dto.ClaudeRequest{Model: "deepseek-v4-flash"},
 			wantPresent: false,
 			wantType:    "",
+			wantBody:    `{"model":"deepseek-v4-flash","thinking":{"type":"disabled"}}`,
+		},
+		{
+			// 生产实测：Claude Code 关闭思考时显式传 disabled 而非省略字段。
+			// 该字段随后被跨格式转换丢弃，若规则漏放则上游按默认开启思考，
+			// 表现为“客户端越明确说关越会思考”。
+			name:        "客户端显式 disabled 也要显式关闭上游思考",
+			request:     &dto.ClaudeRequest{Model: "deepseek-v4-flash", Thinking: &dto.Thinking{Type: "disabled"}},
+			wantPresent: true,
+			wantType:    "disabled",
 			wantBody:    `{"model":"deepseek-v4-flash","thinking":{"type":"disabled"}}`,
 		},
 		{
