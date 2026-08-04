@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/samber/lo"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -2300,5 +2301,85 @@ func assertJSONEqual(t *testing.T, want, got string) {
 
 	if !reflect.DeepEqual(wantObj, gotObj) {
 		t.Fatalf("json not equal\nwant: %s\ngot:  %s", want, got)
+	}
+}
+
+// 下游（Claude 格式）请求的思考开关必须透出到覆盖上下文：
+// Claude→OpenAI 转换会丢弃 thinking 字段，脚本只能靠上下文区分
+// “客户端主动关闭思考”与“客户端要求思考”。
+func TestBuildParamOverrideContextClientThinking(t *testing.T) {
+	disableThinking := map[string]interface{}{
+		"operations": []interface{}{
+			map[string]interface{}{
+				"path":  "thinking",
+				"mode":  "set",
+				"value": map[string]interface{}{"type": "disabled"},
+				"logic": "AND",
+				"conditions": []interface{}{
+					map[string]interface{}{
+						"path":  "upstream_model",
+						"mode":  "full",
+						"value": "deepseek-v4-flash",
+					},
+					map[string]interface{}{
+						"path":  "client_thinking_present",
+						"mode":  "full",
+						"value": false,
+					},
+				},
+			},
+		},
+	}
+
+	cases := []struct {
+		name        string
+		request     dto.Request
+		wantPresent interface{}
+		wantType    interface{}
+		wantBody    string
+	}{
+		{
+			name:        "客户端开启思考则不改动请求体",
+			request:     &dto.ClaudeRequest{Model: "deepseek-v4-flash", Thinking: &dto.Thinking{Type: "adaptive"}},
+			wantPresent: true,
+			wantType:    "adaptive",
+			wantBody:    `{"model":"deepseek-v4-flash"}`,
+		},
+		{
+			name:        "客户端未传 thinking 视为主动关闭，显式关闭上游思考",
+			request:     &dto.ClaudeRequest{Model: "deepseek-v4-flash"},
+			wantPresent: false,
+			wantType:    "",
+			wantBody:    `{"model":"deepseek-v4-flash","thinking":{"type":"disabled"}}`,
+		},
+		{
+			name:        "非 Claude 格式请求不透出该字段，脚本不生效",
+			request:     &dto.GeneralOpenAIRequest{Model: "deepseek-v4-flash"},
+			wantPresent: nil,
+			wantType:    nil,
+			wantBody:    `{"model":"deepseek-v4-flash"}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info := &RelayInfo{
+				Request:     tc.request,
+				ChannelMeta: &ChannelMeta{UpstreamModelName: "deepseek-v4-flash"},
+			}
+			ctx := BuildParamOverrideContext(info)
+
+			if tc.wantPresent == nil {
+				assert.NotContains(t, ctx, "client_thinking_present")
+				assert.NotContains(t, ctx, "client_thinking_type")
+			} else {
+				assert.Equal(t, tc.wantPresent, ctx["client_thinking_present"])
+				assert.Equal(t, tc.wantType, ctx["client_thinking_type"])
+			}
+
+			got, err := ApplyParamOverride([]byte(`{"model":"deepseek-v4-flash"}`), disableThinking, ctx)
+			require.NoError(t, err)
+			assert.JSONEq(t, tc.wantBody, string(got))
+		})
 	}
 }
