@@ -2316,8 +2316,10 @@ func TestBuildParamOverrideContextClientThinking(t *testing.T) {
 				"value": map[string]interface{}{"type": "disabled"},
 				"logic": "AND",
 				// 判断“客户端是否明确要求思考”，而非判断字段有无：
-				// 客户端关闭思考时会显式传 disabled，此时 client_thinking_present 为 true，
-				// 若按 present==false 判断会漏放，字段又被跨格式转换丢弃，上游反而按默认开启思考。
+				// 中间层可能恒定注入 thinking（例如按独立的 effort 档位造出该字段），
+				// 使 client_thinking_present 恒为 true、不携带任何信号；
+				// 若按 present==false 判断则永不触发，字段又被跨格式转换丢弃，
+				// 上游按默认开启思考，客户端的关闭意图彻底丢失。
 				"conditions": []interface{}{
 					map[string]interface{}{
 						"path":  "upstream_model",
@@ -2370,9 +2372,9 @@ func TestBuildParamOverrideContextClientThinking(t *testing.T) {
 			wantBody:    `{"model":"deepseek-v4-flash","thinking":{"type":"disabled"}}`,
 		},
 		{
-			// 生产实测：Claude Code 关闭思考时显式传 disabled 而非省略字段。
-			// 该字段随后被跨格式转换丢弃，若规则漏放则上游按默认开启思考，
-			// 表现为“客户端越明确说关越会思考”。
+			// 防御性用例：显式 disabled 必须被当作“不要思考”处理，而不是原样透传。
+			// 因为该字段随后会被跨格式转换丢弃，一旦漏放，上游按默认开启思考，
+			// 客户端越明确说“关”反而越会思考。
 			name:        "客户端显式 disabled 也要显式关闭上游思考",
 			request:     &dto.ClaudeRequest{Model: "deepseek-v4-flash", Thinking: &dto.Thinking{Type: "disabled"}},
 			wantPresent: true,
