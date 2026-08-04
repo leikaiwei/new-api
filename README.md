@@ -19,7 +19,8 @@ Fork 自 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)，在上�
 - 为何客户端意图不可恢复：Claude Code 关闭思考时只是**不传** `thinking`，不会传 `{"type":"disabled"}`。字段缺失是"下游主动关闭"的唯一信号，而转换后它与"本就没有该字段"无法区分
 - 修复：`BuildParamOverrideContext` 透出 `client_thinking_present`（bool）与 `client_thinking_type`（string）两个只读上下文字段，取自 `info.Request` 中未经改写的下游原始请求（`ClaudeHelper` 先 `DeepCopy` 再改写 thinking，故 `info.Request` 全程保持原始值）。不改动发往上游的请求体；条件求值在请求体找不到路径时会自动回退到上下文
 - 影响面：纯 opt-in。仅引用这两个字段的渠道脚本受影响，未引用的渠道行为完全不变；非 Claude 格式入口不透出该字段
-- 用法：条件 `client_thinking_present == false` 即"下游主动关闭了思考"，据此显式关闭上游思考。上游默认开启思考的模型（如 DeepSeek 官方）需要这条才能尊重客户端的关闭意图
+- 用法：判断"客户端是否**明确要求**思考"，而不是判断字段有无。`client_thinking_type` 不为 `enabled` 且不为 `adaptive`（两条 `invert: true` 条件 + `logic: AND`）时显式关闭上游思考。上游默认开启思考的模型（如 DeepSeek 官方）需要这条才能尊重客户端的关闭意图
+- **别用 `client_thinking_present == false` 判断"客户端关闭了思考"** — 生产实测 Claude Code 关闭思考时会显式传 `thinking:{"type":"disabled"}` 而非省略该字段，此时 `present` 为 true，规则被跳过，字段又被转换器丢弃，上游反而按默认**开启**思考。即客户端越明确说"关"越会思考。`client_thinking_present` 仅适合"区分字段缺失与显式取值"这类场景
 - 为何不改转换器：让转换器直接映射 `thinking` 只需几行，但会给**所有** Claude→OpenAI 渠道的上游请求默认加上该字段，不认识它的上游可能 400。改上下文则影响面可控，也更利于长期 rebase 上游
 
 **CI：fork 专用 GHCR 镜像构建** — `.github/workflows/fork-ghcr-release.yml`
