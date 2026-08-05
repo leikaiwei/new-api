@@ -146,6 +146,7 @@ func ClaudeMessagesRequestToOpenAIChat(claudeRequest dto.ClaudeRequest, info con
 			}
 			var toolCalls []dto.ToolCallRequest
 			mediaMessages := make([]dto.MediaContent, 0, len(content))
+			thinkingText := ""
 
 			for _, mediaMsg := range content {
 				switch mediaMsg.Type {
@@ -163,6 +164,10 @@ func ClaudeMessagesRequestToOpenAIChat(claudeRequest dto.ClaudeRequest, info con
 						ImageUrl: &dto.MessageImageUrl{Url: imageData},
 					}
 					mediaMessages = append(mediaMessages, mediaMessage)
+				case "thinking":
+					if mediaMsg.Thinking != nil {
+						thinkingText += *mediaMsg.Thinking
+					}
 				case "tool_use":
 					toolCall := dto.ToolCallRequest{
 						ID:   mediaMsg.Id,
@@ -195,6 +200,12 @@ func ClaudeMessagesRequestToOpenAIChat(claudeRequest dto.ClaudeRequest, info con
 			}
 
 			if len(toolCalls) > 0 {
+				// 思考模式下，带 tool_calls 的 assistant 消息必须回传 reasoning_content，
+				// 缺失会导致 DeepSeek 等上游拒绝整个请求；无 thinking 块时补空串占位。
+				// 只挂 assistant：这个 switch 也会处理 user 消息里的内容块。
+				if claudeMessage.Role == "assistant" {
+					openAIMessage.ReasoningContent = &thinkingText
+				}
 				openAIMessage.SetToolCalls(toolCalls)
 			}
 			if len(mediaMessages) > 0 && len(toolCalls) == 0 {
