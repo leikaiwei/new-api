@@ -26,6 +26,22 @@ Fork 自 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)，在上�
 - 已知局限："开启思考"依赖**上游默认开启**（规则跳过时出站不含 `thinking`），而非显式指令。出站只会写 `disabled` 或不写，`enabled`/`adaptive` 能否被上游接受未验证；若上游某天改默认为关，开启态会静默失效
 - 为何不改转换器：让转换器直接映射 `thinking` 只需几行，但会给**所有** Claude→OpenAI 渠道的上游请求默认加上该字段，不认识它的上游可能 400。改上下文则影响面可控，也更利于长期 rebase 上游
 
+**#3 Claude→OpenAI 请求转换丢弃 thinking 块，导致思考模式多轮工具调用被上游拒绝** — `relaykit/relayconvert/internal/claude_messages/to_oai_chat_req.go`
+
+- 症状：Claude Code → LiteLLM（Anthropic 风格）→ new-api → opencode Go → DeepSeek 官方 这条链上，思考模式下发生过 tool call 的多轮会话被上游拒绝：``[invalid_request_error] The `reasoning_content` in the thinking mode must be passed back to the API``。客户端确实把 thinking 块发回来了，但请求到不了上游
+- 上游契约：[DeepSeek 官方文档](https://api-docs.deepseek.com/guides/thinking_mode/)明确「发生过 tool call 时，中间 assistant 的 `reasoning_content` must participate in the context concatenation and must be **passed back to the API**」，缺失即 400；位置是 assistant 消息顶层字段（"at the same level as `content`"）。反之**未**发生 tool call 时该字段不必回传，传了也会被忽略
+- 根因：`ClaudeMessagesRequestToOpenAIChat` 遍历 content 数组的 switch 只有 `text` / `image` / `tool_use` / `tool_result` 四个 case，`thinking` 块无分支命中，既不进 `mediaMessages` 也不进 `toolCalls`，被静默丢弃。而 `dto.ClaudeMediaMessage` 本来就有 `Thinking` / `Signature` 字段，数据已解析进内存，只是没人消费
+- 这是个不对称缺陷：同一个包的**响应**方向做了映射（`to_oai_chat_resp.go` 非流式与流式都会写 `ReasoningContent`），**请求**方向没做。`dto.Message.ReasoningContent` 此前只被响应方向写过
+- 修复：新增 `case "thinking"` 累积思考文本，在已有的 `len(toolCalls) > 0` 分支内赋值给 `openAIMessage.ReasoningContent`。有 thinking 块则透传真实内容，没有则补空串占位（`*string` + `omitempty` 只跳过 nil，指向空串的指针会正常序列化成 `""`）
+- 两处刻意的边界：一是**只在带 `tool_calls` 时写**，因为官方明确无 tool call 时传了也会被忽略，这是 40+ provider 共用的通用转换器，不扩大面积；二是**加 `Role == "assistant"` 守卫**，那个 switch 同时处理 user 消息的内容块（`tool_result` 就在 user 里），而 `reasoning_content` 只能挂 assistant
+- 覆盖面（LiteLLM 侧生产抽样 2777 条带 `tool_use` 的 assistant 消息）：77% 有 thinking 块 → 透传真实内容；1.3% 既无 thinking 块也无下游兜底 → 空串占位修好；余下 21% 由下游按 tool id 认领、本就不报错。注意消息口径与请求口径差异巨大 —— 单条消息 1.3% 的风险，在一个携带约 52 条这类消息的请求里被放大成多数请求受影响
+- 为何空串占位安全（**LiteLLM 侧实测，非本仓库实测**）：以 `prompt_tokens` 为判据，带下游兜底 id 的消息补空占位后 3/3 与地板持平（411），而长文本对照为 616（+205）证明该字段确实计入输入 —— 即空串未引入任何实质内容，也没有挤掉下游原有的思考上下文。另测得思考关闭态（`thinking: {"type":"disabled"}`，`reasoning_tokens=0`）下带 `reasoning_content` 的真实文本 / 空串 / 单空格均为 200，故本补丁无需判断当前是否思考模式
+- 已知保留：上条实验为 n=3、单一时点。若下游将来改为真的回填缓存 reasoning，无条件赋值会盖掉它 —— 后果是丢失思考上下文这一质量退化，不是 400。按现有数据风险很低，但不是零
+- `redacted_thinking` 未单独处理：`ClaudeMediaMessage` 没有承载其密文的 `data` 字段，取不到明文，落到通用的空串占位路径即可
+- OpenRouter 方言未隔离：该方言走请求级 `reasoning` 参数而非消息级 `reasoning_content`，理论上不冲突；不分叉的理由是对称性 —— 响应方向对所有方言都写该字段
+- 影响面：仅 Claude 格式入口 → OpenAI 兼容渠道、且 assistant 消息带 `tool_calls` 这一格。无工具调用的流量字节级不变（有回归测试锁定）
+- 与补丁 #2 的关系：#2 控制**本轮**是否让上游思考，#3 修**历史**思考内容能否回传，两者互不重叠。上线顺序提醒：链路上游若有为绕过此缺陷而做的 `reasoning_content` 注入，必须等本补丁上线后再拆，反序会让无 thinking 块的那部分流量直接 400
+
 **CI：fork 专用 GHCR 镜像构建** — `.github/workflows/fork-ghcr-release.yml`
 
 - 发布 release 时自动构建 amd64 + arm64 推送到 `ghcr.io/leikaiwei/new-api`，不走 Docker Hub
