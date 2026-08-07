@@ -19,7 +19,7 @@
   "stop_reason": "tool_use",
   "model": "gpt-test",
   "usage": {
-    "input_tokens": 10,
+    "input_tokens": 7,
     "cache_creation_input_tokens": 0,
     "cache_read_input_tokens": 3,
     "output_tokens": 5,

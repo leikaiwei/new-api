@@ -103,6 +103,79 @@ func TestBuildClaudeUsageFromOpenAICacheWriteUsage(t *testing.T) {
 	assert.Equal(t, 3616, usage.BillingUsage.OpenAIUsage.PromptTokensDetails.CacheWriteTokens)
 }
 
+// TestBuildClaudeUsageFromOpenAICacheReadSubset pins the cache-read subtraction
+// for upstreams that report cached_tokens without a native cache_write_tokens
+// count (DeepSeek-style OpenAI-compatible endpoints). prompt_tokens already
+// contains the cache read in OpenAI semantics; leaving it unadjusted makes
+// input_tokens carry the cache read that Anthropic-semantics consumers then add
+// a second time, so the same prefix gets billed twice.
+func TestBuildClaudeUsageFromOpenAICacheReadSubset(t *testing.T) {
+	tests := []struct {
+		name              string
+		promptTokens      int
+		cachedTokens      int
+		cachedCreation    int
+		wantInputTokens   int
+		wantCacheRead     int
+		wantCacheCreation int
+	}{
+		{
+			name:            "cache read without native cache write",
+			promptTokens:    32000,
+			cachedTokens:    28864,
+			wantInputTokens: 3136,
+			wantCacheRead:   28864,
+		},
+		{
+			name:            "full cache hit leaves no uncached remainder",
+			promptTokens:    4096,
+			cachedTokens:    4096,
+			wantInputTokens: 0,
+			wantCacheRead:   4096,
+		},
+		{
+			name:            "no cache passes prompt tokens through unchanged",
+			promptTokens:    512,
+			wantInputTokens: 512,
+		},
+		{
+			name:              "legacy cached creation tokens are subtracted too",
+			promptTokens:      1000,
+			cachedTokens:      600,
+			cachedCreation:    300,
+			wantInputTokens:   100,
+			wantCacheRead:     600,
+			wantCacheCreation: 300,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			usage := buildClaudeUsageFromOpenAIUsage(&dto.Usage{
+				PromptTokens:     tc.promptTokens,
+				CompletionTokens: 7,
+				TotalTokens:      tc.promptTokens + 7,
+				PromptTokensDetails: dto.InputTokenDetails{
+					CachedTokens:         tc.cachedTokens,
+					CachedCreationTokens: tc.cachedCreation,
+				},
+			})
+
+			require.NotNil(t, usage)
+			assert.Equal(t, tc.wantInputTokens, usage.InputTokens)
+			assert.Equal(t, tc.wantCacheRead, usage.CacheReadInputTokens)
+			assert.Equal(t, tc.wantCacheCreation, usage.CacheCreationInputTokens)
+			assert.Equal(t, 7, usage.OutputTokens)
+			// Billing keeps the untouched OpenAI numbers, so quota calculation is
+			// unaffected by the Anthropic-shaped rewrite above.
+			require.NotNil(t, usage.BillingUsage)
+			require.NotNil(t, usage.BillingUsage.OpenAIUsage)
+			assert.Equal(t, tc.promptTokens, usage.BillingUsage.OpenAIUsage.PromptTokens)
+			assert.Equal(t, tc.cachedTokens, usage.BillingUsage.OpenAIUsage.PromptTokensDetails.CachedTokens)
+		})
+	}
+}
+
 func TestStreamResponseOpenAI2ClaudeClosesTextThinkingAndToolBlocks(t *testing.T) {
 	info := &convmeta.Values{
 		ClaudeConvertInfo: &convmeta.ClaudeConvertInfo{
