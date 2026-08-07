@@ -42,6 +42,20 @@ Fork 自 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)，在上�
 - 影响面：仅 Claude 格式入口 → OpenAI 兼容渠道、且 assistant 消息带 `tool_calls` 这一格。无工具调用的流量字节级不变（有回归测试锁定）
 - 与补丁 #2 的关系：#2 控制**本轮**是否让上游思考，#3 修**历史**思考内容能否回传，两者互不重叠。上线顺序提醒：链路上游若有为绕过此缺陷而做的 `reasoning_content` 注入，必须等本补丁上线后再拆，反序会让无 thinking 块的那部分流量直接 400
 
+**#4 OpenAI→Claude 响应转换未减去缓存 token，下游按 Anthropic 语义重复计入** — `relaykit/relayconvert/internal/oai_chat/to_claude_messages_resp.go`
+
+- 症状：Claude Code → LiteLLM（Anthropic 风格）→ new-api → OpenAI 兼容渠道 这条链上，LiteLLM 侧统计的输入 token 恒定偏高，偏高量正好等于缓存命中量
+- 两套语义的差异：OpenAI 的 `prompt_tokens` **已包含** `cached_tokens`（后者是子集）；Anthropic 的 `input_tokens` **不含** `cache_read_input_tokens`，两者是独立可加项。把 OpenAI 的 `prompt_tokens` 原样塞进 `input_tokens`、同时又填 `cache_read_input_tokens`，下游按 Anthropic 语义相加就把同一段前缀计了两遍
+- 根因：`buildClaudeUsageFromOpenAIUsage` 里减法代码本来就有、注释也写明了语义差异，但被 `if oaiUsage.PromptTokensDetails.CacheWriteTokens > 0` 挡住。`cache_write_tokens` 是 OpenAI 原生缓存写入字段，opencode zen / DeepSeek 这条上游不报；`cached_creation_tokens` 是 new-api 内部字段、只在 Claude→OpenAI 方向赋值。两者恒为 0，减法永不执行
+- 修复：去掉该闸门，无条件减。原有的负数 clamp 保留 —— 两个计数都是未调整前缀，可能重叠
+- 影响面精确到一格：仅"上游报了 `cached_tokens` 但不报 `cache_write_tokens`"这一种情况行为改变。上游报 `cache_write_tokens` 的走的还是原来那条减法；完全无缓存时 `cached_tokens` 为 0，减法退化为恒等。golden 快照实测只有 `response/openai_to_claude` 一行变化（`input_tokens` 10→7，该 fixture 的 `cached_tokens` 为 3），其余 `*_to_claude` 快照因 fixture 无缓存而字节不变
+- **new-api 自身计费不受影响**：`convertOAIChatResponseToClaudeMessages` 回给计费层的是 `UsageFromChatUsage(&chatResponse.Usage)`（OpenAI 侧原值），流式侧是 `state.Usage`，两条都不经过本函数；`service/text_quota.go` 也自己做了 `baseTokens - cached` 的减法。错的一直只是回吐给客户端的那份 Anthropic 形状 usage
+- 反向不会双减：`to_oai_chat_resp.go` 的 `buildOpenAIStyleUsageFromClaudeUsage` 刻意把 `PromptTokens` 造成"含缓存"的 OpenAI 语义，与本侧对称
+- 下游不是 bug：LiteLLM `llms/anthropic/chat/transformation.py` 里的 `prompt_tokens += cache_read_input_tokens` 对真 Anthropic 上游是正确的，问题全在 new-api 这一侧
+- 定位判据是不同上游路径的 `cache_read / text_tokens` 比值：经 new-api 的路径恒定 90.2%（n=9347），而真 Anthropic 上游（dashscope）可达 945.9%（n=388）。后者正常 —— Anthropic 语义下 raw input 只是未命中那一小块，缓存可以是它的好几倍；前者恒等于缓存命中率（上游自报 91.1%），说明 `input_tokens` 里含着整份缓存。**该判据取自 LiteLLM 侧日志统计，非本仓库实测**
+- 未实测项：上线前未直接抓取 new-api 出站的 `input_tokens` 原值（不落日志、只能实时抓，且渠道有月度限额、#1/#2 已因 429 被自动禁用过）。修复正确性由上述语义分析加 golden 与单测锁定，不是端到端实测
+- 为何不能靠配置绕开：`param_override` 的 11 个调用点全部作用于出站请求体，仓库内无响应侧覆盖钩子；渠道 `setting` 字段也无一与 usage 相关。唯一免改源码的路径是把该模型的 LiteLLM 入口换成 OpenAI 风格，但那会让补丁 #2 的 `client_thinking_type` 上下文字段（仅 `info.Request` 为 `*dto.ClaudeRequest` 时注入）与补丁 #3 一并失效，代价远大于收益
+
 **CI：fork 专用 GHCR 镜像构建** — `.github/workflows/fork-ghcr-release.yml`
 
 - 发布 release 时自动构建 amd64 + arm64 推送到 `ghcr.io/leikaiwei/new-api`，不走 Docker Hub
