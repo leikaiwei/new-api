@@ -192,11 +192,9 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 			oaiUsage = state.Usage
 		}
 		if oaiUsage != nil {
+			hasToolUse := state.LastMessagesType == convmeta.LastMessageTypeTools
 			appendStopOpenBlocks()
-			stopReason := stopReasonOpenAI2Claude(state.FinishReason)
-			if stopReason == "" {
-				stopReason = "end_turn"
-			}
+			stopReason := claudeStopReasonWithToolUse(stopReasonOpenAI2Claude(state.FinishReason), hasToolUse)
 			claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
 				Type:  "message_delta",
 				Usage: buildClaudeUsageFromOpenAIUsage(oaiUsage),
@@ -212,6 +210,9 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 		return claudeResponses
 	} else {
 		chosenChoice := openAIResponse.Choices[0]
+		// 同一帧可能既带 tool_calls 又带文本增量，LastMessagesType 会被后者覆盖，
+		// 故在本帧处理前取快照，再并入本帧新增的工具调用。
+		hadToolUse := state.LastMessagesType == convmeta.LastMessageTypeTools || len(chosenChoice.Delta.ToolCalls) > 0
 		doneChunk := chosenChoice.FinishReason != nil && *chosenChoice.FinishReason != ""
 		if doneChunk {
 			state.FinishReason = *chosenChoice.FinishReason
@@ -366,7 +367,12 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 		}
 		appendCitationDeltas(chosenChoice.Delta.Annotations)
 
-		if doneChunk || state.Done {
+		// 上游可能先发只带 finish_reason 的帧（收尾被推迟到下一帧），
+		// 而随后的 usage 帧仍带非空 choices。此时本帧自身没有 finish_reason，
+		// 若只看 doneChunk 便永远不会收尾，message_delta / message_stop 全部丢失，
+		// 客户端既不知该执行工具也不知本轮已结束，表现为对话卡住。
+		pendingFinish := state.FinishReason != "" && (openAIResponse.Usage != nil || state.Usage != nil)
+		if doneChunk || state.Done || pendingFinish {
 			oaiUsage := openAIResponse.Usage
 			if oaiUsage == nil {
 				oaiUsage = state.Usage
@@ -382,7 +388,7 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 				Type:  "message_delta",
 				Usage: buildClaudeUsageFromOpenAIUsage(oaiUsage),
 				Delta: &dto.ClaudeMediaMessage{
-					StopReason: kitutil.GetPointer[string](stopReasonOpenAI2Claude(state.FinishReason)),
+					StopReason: kitutil.GetPointer[string](claudeStopReasonWithToolUse(stopReasonOpenAI2Claude(state.FinishReason), hadToolUse)),
 				},
 			})
 			claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
@@ -405,10 +411,10 @@ func FinalizeStreamResponseOpenAI2Claude(info convmeta.Meta) []*dto.ClaudeRespon
 		return nil
 	}
 
-	stopReason := stopReasonOpenAI2Claude(state.FinishReason)
-	if stopReason == "" {
-		stopReason = "end_turn"
-	}
+	stopReason := claudeStopReasonWithToolUse(
+		stopReasonOpenAI2Claude(state.FinishReason),
+		state.LastMessagesType == convmeta.LastMessageTypeTools,
+	)
 	responses := startPendingToolBlocks(state)
 	responses = append(responses, stopOpenBlocks(state)...)
 	responses = append(responses,
@@ -471,7 +477,14 @@ func ResponseOpenAI2Claude(openAIResponse *dto.OpenAITextResponse, info convmeta
 		}
 	}
 	claudeResponse.Content = contents
-	claudeResponse.StopReason = stopReason
+	hasToolUse := false
+	for _, content := range contents {
+		if content.Type == "tool_use" {
+			hasToolUse = true
+			break
+		}
+	}
+	claudeResponse.StopReason = claudeStopReasonWithToolUse(stopReason, hasToolUse)
 	claudeResponse.Usage = buildClaudeUsageFromOpenAIUsage(&openAIResponse.Usage)
 
 	return claudeResponse
@@ -479,4 +492,17 @@ func ResponseOpenAI2Claude(openAIResponse *dto.OpenAITextResponse, info convmeta
 
 func stopReasonOpenAI2Claude(reason string) string {
 	return reasonmap.OpenAIFinishReasonToClaudeStopReason(reason)
+}
+
+// 本轮已产出 tool_use 块时，stop_reason 必须是 tool_use。
+// 上游可能漏掉收尾帧的 finish_reason，或把带工具调用的一轮标成 stop；
+// 若照搬成 end_turn，客户端会认为没有待执行的工具而停下。
+func claudeStopReasonWithToolUse(rawStopReason string, hasToolUse bool) string {
+	if hasToolUse {
+		return "tool_use"
+	}
+	if rawStopReason == "" {
+		return "end_turn"
+	}
+	return rawStopReason
 }

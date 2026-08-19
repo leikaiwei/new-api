@@ -224,7 +224,12 @@ func HandleFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, lastStream
 		for _, resp := range claudeResponses {
 			_ = helper.ClaudeData(c, *resp)
 		}
-		info.ClaudeConvertInfo.Done = true
+		// 最后一道兜底：上游若在收尾事件产出前就断流，这里补发
+		// content_block_stop / message_delta / message_stop。
+		// Finalize 内部以 state.Done 幂等，已正常收尾的流不会重复发送。
+		for _, resp := range relayconvert.FinalizeStreamResponseOpenAI2Claude(info) {
+			_ = helper.ClaudeData(c, *resp)
+		}
 
 	case types.RelayFormatGemini:
 		var streamResponse dto.ChatCompletionsStreamResponse
