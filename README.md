@@ -56,6 +56,21 @@ Fork 自 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)，在上�
 - 未实测项：上线前未直接抓取 new-api 出站的 `input_tokens` 原值（不落日志、只能实时抓，且渠道有月度限额、#1/#2 已因 429 被自动禁用过）。修复正确性由上述语义分析加 golden 与单测锁定，不是端到端实测
 - 为何不能靠配置绕开：`param_override` 的 11 个调用点全部作用于出站请求体，仓库内无响应侧覆盖钩子；渠道 `setting` 字段也无一与 usage 相关。唯一免改源码的路径是把该模型的 LiteLLM 入口换成 OpenAI 风格，但那会让补丁 #2 的 `client_thinking_type` 上下文字段（仅 `info.Request` 为 `*dto.ClaudeRequest` 时注入）与补丁 #3 一并失效，代价远大于收益
 
+**#5 OpenAI→Claude 流式转换丢失工具调用轮次的收尾事件，客户端卡住** — `relaykit/relayconvert/internal/oai_chat/to_claude_messages_resp.go`
+
+- 症状：Claude Code → LiteLLM（Anthropic 风格）→ new-api → OpenAI 兼容渠道 这条链上，模型输出一句话后停住不动，工具不执行、也不结束本轮。同一客户端、同样的工具集，换一个上游渠道就正常
+- 根因：上游先发只带 `finish_reason` 的帧（无 usage），转换器按注释所述"把收尾推迟到下一帧"提前 return；而随后的 usage 帧仍带**非空** `choices`，本帧自身没有 `finish_reason`，`doneChunk` 为 false、`state.Done` 也为 false，`if doneChunk || state.Done` 不成立，收尾永不发生。`message_delta` 与 `message_stop` 全部丢失
+- 为何换渠道就好：原逻辑只在收尾 usage 帧的 `choices` 为**空数组**时才走 `len(Choices) == 0` 那条收尾分支。两种上游形态的差别仅此一处，生产日志实测 296/296 全部落在受影响的那一侧，对照渠道 136/136 全部落在正常侧
+- 客户端行为符合规范：Anthropic 流式文档的事件序列里 `message_delta` 恒在最后一个 `content_block_stop` 之后、`message_stop` 之前且只出现一次。转换层输出不完整的 SSE 才是契约违反，客户端把"没收到 message_stop"当作"流未结束"是预期行为
+- 修复：`finish_reason` 已缓存且 usage 到达时即触发收尾，不再依赖本帧是否带 `finish_reason`
+- 同时修正 `stop_reason`：本轮已产出 `tool_use` 块时不得兜底成 `end_turn`，否则客户端同样认为没有待执行的工具。覆盖流式三处收尾与非流式一处；非流式按 `content` 实际内容纠正，因此上游把带工具调用的一轮标成 `stop` 这种自相矛盾的响应也能兜住
+- 并在 EOF 收尾处（`relay/channel/openai/helper.go`）补发 `Finalize` 作为最后兜底，思路取自上游 [PR #6721](https://github.com/QuantumNous/new-api/pull/6721)。`Finalize` 以 `state.Done` 幂等，已正常收尾的流不会重复发送
+- **上游未修**：`fetch upstream` 后领先 47 个提交，无一碰过该文件。把上游 main 那版代码换入后本补丁的回归测试全部失败，非静态推断
+- 上游状态：[#4697](https://github.com/QuantumNous/new-api/issues/4697) 症状一致但 open 三个月无进展，维护者要求复现信息、原帖未给出 SSE 帧的精确形状；[PR #5345](https://github.com/QuantumNous/new-api/pull/5345) 思路接近但有合并冲突，[PR #6046](https://github.com/QuantumNous/new-api/pull/6046) 被作者自行关闭
+- 同类实现参考：LiteLLM `AnthropicStreamWrapper` 把"delta 为空"当作独立的收尾信号（暂存 `message_delta`、等 usage 到达后合并发出，流结束前未等到则 flush 兜底），而非依赖 `choices` 是否为空数组 —— 后者正是本缺陷的脆弱之处
+- 为何不能靠配置绕开：渠道设置两个结构体共 28 个字段，唯二沾响应的 `force_format` 与 `thinking_to_content` 在 `HandleStreamFormat` 里只传给 `RelayFormatOpenAI` 分支，Claude 格式走的 `handleClaudeFormat` 签名里没有这两个参数；其余字段全部作用于出站请求体或传输层。`advanced_custom` 只能选择转换器，不能改其内部逻辑
+- 未实测项：修复由生产日志的帧序列比对加单测锁定，上线后尚需在客户端侧确认同形状请求不再卡住
+
 **CI：fork 专用 GHCR 镜像构建** — `.github/workflows/fork-ghcr-release.yml`
 
 - 发布 release 时自动构建 amd64 + arm64 推送到 `ghcr.io/leikaiwei/new-api`，不走 Docker Hub
