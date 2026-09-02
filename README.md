@@ -10,6 +10,7 @@ Fork 自 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)，在上�
 - 修复：额外记住最后一个带有效 usage 的帧；末帧不含 usage 时从它补回真实用量，以及被元数据帧清空的 `id` / `model` / `system_fingerprint`。`applyUsagePostProcessing` 的 body 参数一并改用该帧，使 DeepSeek / 智谱 / Moonshot 这类需从 body 二次提取 `cached_tokens` 的渠道同样受益（上游 PR #6328 缺的正是这块）。客户端可见的 SSE 内容不变
 - 影响面：token 是限流、配额与用量分析的依据。当前该模型免费（`ModelRatio: 0`）故无计费损失，但这条路径结构上必然少记 output，若放付费模型会**少计费**
 - 上游状态：[#6272](https://github.com/QuantumNous/new-api/issues/6272) open 无人处理，[#6158](https://github.com/QuantumNous/new-api/issues/6158) / [#6500](https://github.com/QuantumNous/new-api/issues/6500) 被 bot 自动判重关成 `not_planned`，三者均无人类维护者回应；[PR #6070](https://github.com/QuantumNous/new-api/pull/6070) 停滞且有冲突，[PR #6328](https://github.com/QuantumNous/new-api/pull/6328) 被作者自行关闭。上游合并后本地补丁可移除
+- 上游 2026-09-03 同步后的现状（**部分收敛，本补丁仍需保留**）：上游 [#7137](https://github.com/QuantumNous/new-api/pull/7137) 加了同向修复 —— 末帧无有效 usage 时回退到 `secondLastStreamData`，并把 `applyUsagePostProcessing` 的 body 参数改用该帧（与本补丁的 `usageFrame` 同思路）。但它只回看**固定的倒数第二帧**，上游追加两个及以上元数据帧时依然失效；也不走 `handleLastResponse`，不补回被元数据帧清空的 `id` / `model` / `system_fingerprint`。本补丁记的是**最后一个带有效 usage 的帧**（`streamDataHasBillableUsage` 逐帧判定），严格覆盖上游那一格，故合并时保留本实现、吸收上游的 debug 日志，并删掉已成冗余的 `secondLastStreamData`
 - 已知遗留（本轮未修）：`Path2RelayMode` 缺 `/v1/messages` 分支这个缺陷本身仍在。补丁 #1 生效后走的是上游真实 usage，本地估算那条死路不会被触达，故无需修；且维护者在 [PR #3340](https://github.com/QuantumNous/new-api/pull/3340) 明确拒绝过在此处加分支，要求各渠道 adaptor 自行适配
 
 **#2 跨格式转换丢弃 thinking，参数覆盖无法识别下游是否主动关闭思考** — `relay/common/override.go`
@@ -42,19 +43,21 @@ Fork 自 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)，在上�
 - 影响面：仅 Claude 格式入口 → OpenAI 兼容渠道、且 assistant 消息带 `tool_calls` 这一格。无工具调用的流量字节级不变（有回归测试锁定）
 - 与补丁 #2 的关系：#2 控制**本轮**是否让上游思考，#3 修**历史**思考内容能否回传，两者互不重叠。上线顺序提醒：链路上游若有为绕过此缺陷而做的 `reasoning_content` 注入，必须等本补丁上线后再拆，反序会让无 thinking 块的那部分流量直接 400
 
-**#4 OpenAI→Claude 响应转换未减去缓存 token，下游按 Anthropic 语义重复计入** — `relaykit/relayconvert/internal/oai_chat/to_claude_messages_resp.go`
+~~**#4 OpenAI→Claude 响应转换未减去缓存 token，下游按 Anthropic 语义重复计入** — `relaykit/relayconvert/internal/oai_chat/to_claude_messages_resp.go`~~
 
-- 症状：Claude Code → LiteLLM（Anthropic 风格）→ new-api → OpenAI 兼容渠道 这条链上，LiteLLM 侧统计的输入 token 恒定偏高，偏高量正好等于缓存命中量
-- 两套语义的差异：OpenAI 的 `prompt_tokens` **已包含** `cached_tokens`（后者是子集）；Anthropic 的 `input_tokens` **不含** `cache_read_input_tokens`，两者是独立可加项。把 OpenAI 的 `prompt_tokens` 原样塞进 `input_tokens`、同时又填 `cache_read_input_tokens`，下游按 Anthropic 语义相加就把同一段前缀计了两遍
-- 根因：`buildClaudeUsageFromOpenAIUsage` 里减法代码本来就有、注释也写明了语义差异，但被 `if oaiUsage.PromptTokensDetails.CacheWriteTokens > 0` 挡住。`cache_write_tokens` 是 OpenAI 原生缓存写入字段，opencode zen / DeepSeek 这条上游不报；`cached_creation_tokens` 是 new-api 内部字段、只在 Claude→OpenAI 方向赋值。两者恒为 0，减法永不执行
-- 修复：去掉该闸门，无条件减。原有的负数 clamp 保留 —— 两个计数都是未调整前缀，可能重叠
-- 影响面精确到一格：仅"上游报了 `cached_tokens` 但不报 `cache_write_tokens`"这一种情况行为改变。上游报 `cache_write_tokens` 的走的还是原来那条减法；完全无缓存时 `cached_tokens` 为 0，减法退化为恒等。golden 快照实测只有 `response/openai_to_claude` 一行变化（`input_tokens` 10→7，该 fixture 的 `cached_tokens` 为 3），其余 `*_to_claude` 快照因 fixture 无缓存而字节不变
-- **new-api 自身计费不受影响**：`convertOAIChatResponseToClaudeMessages` 回给计费层的是 `UsageFromChatUsage(&chatResponse.Usage)`（OpenAI 侧原值），流式侧是 `state.Usage`，两条都不经过本函数；`service/text_quota.go` 也自己做了 `baseTokens - cached` 的减法。错的一直只是回吐给客户端的那份 Anthropic 形状 usage
-- 反向不会双减：`to_oai_chat_resp.go` 的 `buildOpenAIStyleUsageFromClaudeUsage` 刻意把 `PromptTokens` 造成"含缓存"的 OpenAI 语义，与本侧对称
-- 下游不是 bug：LiteLLM `llms/anthropic/chat/transformation.py` 里的 `prompt_tokens += cache_read_input_tokens` 对真 Anthropic 上游是正确的，问题全在 new-api 这一侧
-- 定位判据是不同上游路径的 `cache_read / text_tokens` 比值：经 new-api 的路径恒定 90.2%（n=9347），而真 Anthropic 上游（dashscope）可达 945.9%（n=388）。后者正常 —— Anthropic 语义下 raw input 只是未命中那一小块，缓存可以是它的好几倍；前者恒等于缓存命中率（上游自报 91.1%），说明 `input_tokens` 里含着整份缓存。**该判据取自 LiteLLM 侧日志统计，非本仓库实测**
-- 未实测项：上线前未直接抓取 new-api 出站的 `input_tokens` 原值（不落日志、只能实时抓，且渠道有月度限额、#1/#2 已因 429 被自动禁用过）。修复正确性由上述语义分析加 golden 与单测锁定，不是端到端实测
-- 为何不能靠配置绕开：`param_override` 的 11 个调用点全部作用于出站请求体，仓库内无响应侧覆盖钩子；渠道 `setting` 字段也无一与 usage 相关。唯一免改源码的路径是把该模型的 LiteLLM 入口换成 OpenAI 风格，但那会让补丁 #2 的 `client_thinking_type` 上下文字段（仅 `info.Request` 为 `*dto.ClaudeRequest` 时注入）与补丁 #3 一并失效，代价远大于收益
+> **已由上游修复，本地补丁于 2026-09-03 移除。** 上游 [#7137](https://github.com/QuantumNous/new-api/pull/7137) 把 `buildClaudeUsageFromOpenAIUsage` 委托给 `internal/shared/claude.UsageFromOpenAI`，并把原来那个恒不成立的 `CacheWriteTokens > 0` 闸门换成 `UsageSemantic != BillingUsageSemanticAnthropic` —— 覆盖了本补丁的意图，且多一层保护：usage 本身已是 Anthropic 语义（`input_tokens` 本就不含缓存）时不再减，避免真 Anthropic 上游被双减。生产代码已回退到上游实现，只保留本补丁附带的回归测试 `TestBuildClaudeUsageFromOpenAICacheReadSubset`，它断言的契约在上游实现下依然成立且通过。以下原始记录保留备查。
+
+- ~~症状：Claude Code → LiteLLM（Anthropic 风格）→ new-api → OpenAI 兼容渠道 这条链上，LiteLLM 侧统计的输入 token 恒定偏高，偏高量正好等于缓存命中量~~
+- ~~两套语义的差异：OpenAI 的 `prompt_tokens` **已包含** `cached_tokens`（后者是子集）；Anthropic 的 `input_tokens` **不含** `cache_read_input_tokens`，两者是独立可加项。把 OpenAI 的 `prompt_tokens` 原样塞进 `input_tokens`、同时又填 `cache_read_input_tokens`，下游按 Anthropic 语义相加就把同一段前缀计了两遍~~
+- ~~根因：`buildClaudeUsageFromOpenAIUsage` 里减法代码本来就有、注释也写明了语义差异，但被 `if oaiUsage.PromptTokensDetails.CacheWriteTokens > 0` 挡住。`cache_write_tokens` 是 OpenAI 原生缓存写入字段，opencode zen / DeepSeek 这条上游不报；`cached_creation_tokens` 是 new-api 内部字段、只在 Claude→OpenAI 方向赋值。两者恒为 0，减法永不执行~~
+- ~~修复：去掉该闸门，无条件减。原有的负数 clamp 保留 —— 两个计数都是未调整前缀，可能重叠~~
+- ~~影响面精确到一格：仅"上游报了 `cached_tokens` 但不报 `cache_write_tokens`"这一种情况行为改变。上游报 `cache_write_tokens` 的走的还是原来那条减法；完全无缓存时 `cached_tokens` 为 0，减法退化为恒等。golden 快照实测只有 `response/openai_to_claude` 一行变化（`input_tokens` 10→7，该 fixture 的 `cached_tokens` 为 3），其余 `*_to_claude` 快照因 fixture 无缓存而字节不变~~
+- ~~**new-api 自身计费不受影响**：`convertOAIChatResponseToClaudeMessages` 回给计费层的是 `UsageFromChatUsage(&chatResponse.Usage)`（OpenAI 侧原值），流式侧是 `state.Usage`，两条都不经过本函数；`service/text_quota.go` 也自己做了 `baseTokens - cached` 的减法。错的一直只是回吐给客户端的那份 Anthropic 形状 usage~~
+- ~~反向不会双减：`to_oai_chat_resp.go` 的 `buildOpenAIStyleUsageFromClaudeUsage` 刻意把 `PromptTokens` 造成"含缓存"的 OpenAI 语义，与本侧对称~~
+- ~~下游不是 bug：LiteLLM `llms/anthropic/chat/transformation.py` 里的 `prompt_tokens += cache_read_input_tokens` 对真 Anthropic 上游是正确的，问题全在 new-api 这一侧~~
+- ~~定位判据是不同上游路径的 `cache_read / text_tokens` 比值：经 new-api 的路径恒定 90.2%（n=9347），而真 Anthropic 上游（dashscope）可达 945.9%（n=388）。后者正常 —— Anthropic 语义下 raw input 只是未命中那一小块，缓存可以是它的好几倍；前者恒等于缓存命中率（上游自报 91.1%），说明 `input_tokens` 里含着整份缓存。**该判据取自 LiteLLM 侧日志统计，非本仓库实测**~~
+- ~~未实测项：上线前未直接抓取 new-api 出站的 `input_tokens` 原值（不落日志、只能实时抓，且渠道有月度限额、#1/#2 已因 429 被自动禁用过）。修复正确性由上述语义分析加 golden 与单测锁定，不是端到端实测~~
+- ~~为何不能靠配置绕开：`param_override` 的 11 个调用点全部作用于出站请求体，仓库内无响应侧覆盖钩子；渠道 `setting` 字段也无一与 usage 相关。唯一免改源码的路径是把该模型的 LiteLLM 入口换成 OpenAI 风格，但那会让补丁 #2 的 `client_thinking_type` 上下文字段（仅 `info.Request` 为 `*dto.ClaudeRequest` 时注入）与补丁 #3 一并失效，代价远大于收益~~
 
 **#5 OpenAI→Claude 流式转换丢失工具调用轮次的收尾事件，客户端卡住** — `relaykit/relayconvert/internal/oai_chat/to_claude_messages_resp.go`
 
@@ -65,7 +68,7 @@ Fork 自 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)，在上�
 - 修复：`finish_reason` 已缓存且 usage 到达时即触发收尾，不再依赖本帧是否带 `finish_reason`
 - 同时修正 `stop_reason`：本轮已产出 `tool_use` 块时不得兜底成 `end_turn`，否则客户端同样认为没有待执行的工具。覆盖流式三处收尾与非流式一处；非流式按 `content` 实际内容纠正，因此上游把带工具调用的一轮标成 `stop` 这种自相矛盾的响应也能兜住
 - 并在 EOF 收尾处（`relay/channel/openai/helper.go`）补发 `Finalize` 作为最后兜底，思路取自上游 [PR #6721](https://github.com/QuantumNous/new-api/pull/6721)。`Finalize` 以 `state.Done` 幂等，已正常收尾的流不会重复发送
-- **上游未修**：`fetch upstream` 后领先 47 个提交，无一碰过该文件。把上游 main 那版代码换入后本补丁的回归测试全部失败，非静态推断
+- **上游仍未修**（2026-09-03 同步 33 个提交后复查）：上游 [#7137](https://github.com/QuantumNous/new-api/pull/7137) 重构了本文件（新增 `startPendingToolBlocks`、把首帧特殊路径并入统一路径），但两个缺陷都还在 —— 收尾条件仍是 `doneChunk || state.Done`，带非空 `choices` 的 usage 帧依旧接不上；四处 `stop_reason` 也仍是 `"" → end_turn`，无 `tool_use` 判定。本补丁已在上游新结构上重新落位，回归测试全部通过
 - 上游状态：[#4697](https://github.com/QuantumNous/new-api/issues/4697) 症状一致但 open 三个月无进展，维护者要求复现信息、原帖未给出 SSE 帧的精确形状；[PR #5345](https://github.com/QuantumNous/new-api/pull/5345) 思路接近但有合并冲突，[PR #6046](https://github.com/QuantumNous/new-api/pull/6046) 被作者自行关闭
 - 同类实现参考：LiteLLM `AnthropicStreamWrapper` 把"delta 为空"当作独立的收尾信号（暂存 `message_delta`、等 usage 到达后合并发出，流结束前未等到则 flush 兜底），而非依赖 `choices` 是否为空数组 —— 后者正是本缺陷的脆弱之处
 - 为何不能靠配置绕开：渠道设置两个结构体共 28 个字段，唯二沾响应的 `force_format` 与 `thinking_to_content` 在 `HandleStreamFormat` 里只传给 `RelayFormatOpenAI` 分支，Claude 格式走的 `handleClaudeFormat` 签名里没有这两个参数；其余字段全部作用于出站请求体或传输层。`advanced_custom` 只能选择转换器，不能改其内部逻辑
