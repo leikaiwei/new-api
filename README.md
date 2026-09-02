@@ -74,6 +74,18 @@ Fork 自 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)，在上�
 - 为何不能靠配置绕开：渠道设置两个结构体共 28 个字段，唯二沾响应的 `force_format` 与 `thinking_to_content` 在 `HandleStreamFormat` 里只传给 `RelayFormatOpenAI` 分支，Claude 格式走的 `handleClaudeFormat` 签名里没有这两个参数；其余字段全部作用于出站请求体或传输层。`advanced_custom` 只能选择转换器，不能改其内部逻辑
 - 未实测项：修复由生产日志的帧序列比对加单测锁定，上线后尚需在客户端侧确认同形状请求不再卡住
 
+**#6 Claude 工具的显式 `type:"custom"` 被当成 hosted tool 丢弃，Agent 客户端拿不到任何工具** — `relaykit/relayconvert/internal/toolconv/decode.go`
+
+- 症状：Claude Code / Codely CLI 这类 Agent 客户端经 Claude→OpenAI 转换后，出站请求的 `tools` 为空数组，模型无工具可调，对话空转。日志刷 `conversion diagnostic: code="unsupported_hosted_tool" ... message="OpenAI Chat Completions cannot represent hosted tool \"custom\""`，并在 32 条后 truncated
+- 引入版本：上游 [#7137](https://github.com/QuantumNous/new-api/pull/7137) 新增的 hosted-tool 转换保真层。**2026-09-03 升级 `fork-20260903.1` 时在生产暴露，已当场回滚**
+- 根因：Anthropic 允许自定义工具显式写 `type:"custom"`，用于和 `computer_20241022` / `bash_20250124` 这类 hosted tool 区分，语义等同于省略 `type`；而 OpenAI Responses 的 `custom` 指的是接受自由文本输入的特殊工具，两者语义相反。`decodeClaudeDefinition` 对非空 `type` 一律走通用的 `kindFromNativeType`，该表按 Responses 语义把 `custom` 判成 `KindNative` 且不填 `Function`，各 encode 目标的 switch 便落到 `default` 分支整份丢弃
+- 为何上游自己的测试没发现：上游确实有一条 `{"type":"custom","name":"apply_patch"}` 的用例，但它是 **OpenAI Responses→Gemini** 方向，断言 `assert.Empty(t, geminiReq.GetTools())` —— 在那个方向丢弃是正确的。缺的是 Claude 作为**来源**时的同名用例
+- 修复：只放行 Claude 解码路径上的 `custom`，让它与省略 `type` 走同一条 `KindFunction` 分支。不动 `kindFromNativeType`，Responses 方向的判定保持不变
+- 为何 `NativeType` 仍保留 `"custom"`：`KindFunction` 分支里唯一消费 `NativeType` 的是 `encode.go` 中 `set.Source == RelayFormatOpenAIResponses` 那条守卫，来源为 Claude 时不触发；保留它有利于 Claude→X→Claude 的往返保真
+- 影响面：仅 Claude 格式入口、且工具定义显式带 `type:"custom"` 这一格。省略 `type` 的简写形状原本就正常，行为不变（有对照测试锁定）
+- 回归覆盖两层：`toolconv` 直接断言解码契约（`Kind` / `Function` / `NativeType`，并另测 `computer` / `code_execution` / `mcp` 三个真 hosted tool 不被误伤），`relayconvert` 走生产入口 `ConvertRequest` 覆盖 tools 经 `ExtractRequest` / `AttachRequest` 的真实路径。**两者在回退本修复后都会失败，非静态推断** —— 第一版端到端测试误调了转换器内部函数 `ClaudeMessagesRequestToOpenAIChat`，回退后仍通过，因为生产路径的 tools 由 `toolconv` 接管、转换器自身那段处理会被覆盖
+- 上游状态：尚未反馈
+
 **CI：fork 专用 GHCR 镜像构建** — `.github/workflows/fork-ghcr-release.yml`
 
 - 发布 release 时自动构建 amd64 + arm64 推送到 `ghcr.io/leikaiwei/new-api`，不走 Docker Hub
