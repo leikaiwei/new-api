@@ -313,6 +313,9 @@ func decodeOpenAIResponsesDefinition(raw json.RawMessage) (Definition, error) {
 	}, nil
 }
 
+// Anthropic 自定义工具的显式类型标记，语义等同于不带 type 的工具定义。
+const claudeCustomToolType = "custom"
+
 func decodeClaudeDefinition(raw json.RawMessage) (Definition, error) {
 	var tool map[string]any
 	if err := kitutil.Unmarshal(raw, &tool); err != nil {
@@ -372,12 +375,17 @@ func decodeClaudeDefinition(raw json.RawMessage) (Definition, error) {
 			Raw:        cloneRaw(raw),
 		}, nil
 	}
-	if toolType == "" {
+	// Anthropic 用显式的 type:"custom" 标记普通自定义工具，以区别于 computer/bash 这类 hosted tool；
+	// 而 OpenAI Responses 的 custom 是接受自由文本输入的特殊工具，两者语义相反。
+	// 通用的 kindFromNativeType 按后者把 custom 归为 KindNative，Claude 侧若照用，
+	// 整份客户端自定义工具都会被当成不可表示的 hosted tool 丢弃，Agent 类客户端将拿不到任何工具。
+	if toolType == "" || toolType == claudeCustomToolType {
 		return Definition{
-			Kind:      KindFunction,
-			Execution: ExecutionClient,
-			Name:      strings.TrimSpace(kitutil.Interface2String(tool["name"])),
-			Raw:       cloneRaw(raw),
+			Kind:       KindFunction,
+			Execution:  ExecutionClient,
+			NativeType: toolType,
+			Name:       strings.TrimSpace(kitutil.Interface2String(tool["name"])),
+			Raw:        cloneRaw(raw),
 			Function: &Function{
 				Name:        strings.TrimSpace(kitutil.Interface2String(tool["name"])),
 				Description: kitutil.Interface2String(tool["description"]),
