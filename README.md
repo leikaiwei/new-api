@@ -86,6 +86,16 @@ Fork 自 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)，在上�
 - 回归覆盖两层：`toolconv` 直接断言解码契约（`Kind` / `Function` / `NativeType`，并另测 `computer` / `code_execution` / `mcp` 三个真 hosted tool 不被误伤），`relayconvert` 走生产入口 `ConvertRequest` 覆盖 tools 经 `ExtractRequest` / `AttachRequest` 的真实路径。**两者在回退本修复后都会失败，非静态推断** —— 第一版端到端测试误调了转换器内部函数 `ClaudeMessagesRequestToOpenAIChat`，回退后仍通过，因为生产路径的 tools 由 `toolconv` 接管、转换器自身那段处理会被覆盖
 - 上游状态：尚未反馈
 
+**#7 上游网关要求的会话亲和头无法从请求体推导，参数覆盖只能写静态值** — `relay/common/override.go`
+
+- 症状：opencode Go 官方 2026-09-04 邮件通知，new-api 发出的请求（UA "Go HTTP client"）缺少 `X-Opencode-Session`，要求 09/06 起每个请求带一个 "stable per-conversation ID"，否则可能报错。该头是网关的会话亲和键，用于把同一对话钉到同一后端做 prompt cache
+- 为何配置做不到：渠道 `header_override` 只支持静态值、`{api_key}`、`{client_header:<入站头>}` 与入站头透传；参数覆盖的 `set_header` 只能写常量，`copy_header` 只能从入站头复制。而真正的对话 ID 在 Claude 请求体的 `metadata.user_id` 里（新版 Claude Code 是含 `session_id` 的 JSON 串，不再是 `user_<hash>_account_<uuid>_session_<uuid>`），Claude→OpenAI 转换又会把 `metadata` 整个丢掉；中间层（LiteLLM）出站也不带任何会话头。仓库里没有一处能把请求体字段写进出站请求头
+- 修复：`BuildParamOverrideContext` 新增 `client_session_id`，依次取入站头 `x-claude-code-session-id`、Claude `metadata.user_id`（兼容 JSON 串与旧形态）、OpenAI `prompt_cache_key`，都没有时退到 system 与首条 user 消息的哈希 —— 对话历史只追加，所以跨轮稳定，无 ID 的客户端与中间层健康检查也能钉住同一对话。`set_header` 的字符串值支持 `${变量}` 引用上下文，解析为空则不发该头。渠道侧只需一条规则 `{"mode":"set_header","path":"X-Opencode-Session","value":"${client_session_id}"}`
+- 为何不在中间层做：LiteLLM 侧只有 Claude Code 流量能解出会话 ID（约 85%），Codex Desktop、OpenAI 格式客户端、LiteLLM 自身每 300 s 一次的健康检查都没有，且要重启 LiteLLM；new-api 是唯一能覆盖 100% 出站请求的位置
+- 影响面：只有显式写了 `${…}` 模板的 `set_header` 规则受影响，静态值行为不变；`client_session_id` 仅是上下文里多一个字段，不改任何请求体。模板展开只作用于 `set_header` 的规则值，不作用于 `copy_header` 复制来的入站头值，客户端无法借头值引用上下文
+- 回归：推导四种来源与「无 ID 不发空头」各一例、哈希在轮次增长与内容块形态翻转下不变、`set_header` 模板端到端走 `ApplyParamOverrideWithRelayInfo` 断言运行时请求头。**回退 `set_header` 那一行后模板三例全部失败，非静态推断**
+- 上游状态：尚未反馈
+
 **CI：fork 专用 GHCR 镜像构建** — `.github/workflows/fork-ghcr-release.yml`
 
 - 发布 release 时自动构建 amd64 + arm64 推送到 `ghcr.io/leikaiwei/new-api`，不走 Docker Hub
