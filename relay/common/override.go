@@ -1,6 +1,8 @@
 package common
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -1016,7 +1018,7 @@ func applyOperations(jsonData []byte, operations []ParamOperation, conditionCont
 				}
 			}
 		case "set_header":
-			err = setHeaderOverrideInContext(context, op.Path, op.Value, op.KeepOrigin)
+			err = setHeaderOverrideInContext(context, op.Path, expandHeaderValueTemplate(context, op.Value), op.KeepOrigin)
 			if err == nil {
 				auditRecorder.recordOperation("set_header", op.Path, "", "", op.Value)
 				contextJSON, err = marshalContextJSON(context)
@@ -2172,6 +2174,7 @@ func mergeObjects(data []byte, path string, value interface{}, keepOrigin bool) 
 //   - using_group：当前实际使用的分组，自动跨分组重试时可能变化。
 //   - request_path：请求路径
 //   - client_thinking_present/client_thinking_type：下游原始请求的思考开关。
+//   - client_session_id：下游对话的稳定标识（见 clientSessionID），供 set_header 模板引用。
 //   - is_channel_test：是否为渠道测试请求（同 is_test）。
 func BuildParamOverrideContext(info *RelayInfo) map[string]interface{} {
 	if info == nil {
@@ -2197,6 +2200,11 @@ func BuildParamOverrideContext(info *RelayInfo) map[string]interface{} {
 		} else {
 			ctx["client_thinking_type"] = ""
 		}
+	}
+	// 下游对话标识。上游网关（如 opencode 的 X-Opencode-Session）要求每个请求带一个跨轮稳定的
+	// 对话 ID 做缓存亲和；跨格式转换会丢弃 metadata，故在此推导后透出，由 set_header 模板引用。
+	if sessionID := clientSessionID(info); sessionID != "" {
+		ctx["client_session_id"] = sessionID
 	}
 	if info.OriginModelName != "" {
 		ctx["original_model"] = info.OriginModelName
@@ -2245,4 +2253,151 @@ func BuildParamOverrideContext(info *RelayInfo) map[string]interface{} {
 
 	ctx["is_channel_test"] = info.IsChannelTest
 	return ctx
+}
+
+var headerValueTemplatePattern = regexp.MustCompile(`\$\{([A-Za-z0-9_]+)\}`)
+
+// expandHeaderValueTemplate 把 set_header 字符串值里的 ${name} 替换为覆盖上下文中的同名标量；
+// 未定义或非标量的变量替换为空串，整体为空时调用方会跳过该请求头。非字符串值原样返回。
+func expandHeaderValueTemplate(context map[string]interface{}, value interface{}) interface{} {
+	template, ok := value.(string)
+	if !ok || !strings.Contains(template, "${") {
+		return value
+	}
+	return headerValueTemplatePattern.ReplaceAllStringFunc(template, func(token string) string {
+		raw, exists := context[token[2:len(token)-1]]
+		if !exists || raw == nil {
+			return ""
+		}
+		switch raw.(type) {
+		case map[string]interface{}, []interface{}:
+			return ""
+		}
+		return strings.TrimSpace(fmt.Sprintf("%v", raw))
+	})
+}
+
+// clientSessionID 推导下游对话的稳定标识，依次取：
+//  1. 入站请求头 x-claude-code-session-id（Claude Code 每个请求都带，中间层若转发则最准）
+//  2. Claude 请求的 metadata.user_id：新版 Claude Code 是含 session_id 的 JSON 串，
+//     旧版是 user_<hash>_account_<uuid>_session_<uuid>
+//  3. OpenAI 请求的 prompt_cache_key（语义相同）
+//  4. 兜底：system 与首条 user 消息的哈希。对话历史只追加，故同一对话各轮取值一致
+func clientSessionID(info *RelayInfo) string {
+	for key, value := range info.RequestHeaders {
+		if strings.EqualFold(key, "x-claude-code-session-id") && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	switch request := info.Request.(type) {
+	case *dto.ClaudeRequest:
+		if request == nil {
+			return ""
+		}
+		if id := claudeMetadataSessionID(request.Metadata); id != "" {
+			return id
+		}
+		return conversationHash(claudeSystemText(request), claudeFirstUserText(request))
+	case *dto.GeneralOpenAIRequest:
+		if request == nil {
+			return ""
+		}
+		if key := strings.TrimSpace(request.PromptCacheKey); key != "" {
+			return key
+		}
+		return conversationHash(openAIFirstMessageText(request, "system"), openAIFirstMessageText(request, "user"))
+	case *dto.OpenAIResponsesRequest:
+		if request == nil || len(request.PromptCacheKey) == 0 {
+			return ""
+		}
+		var key string
+		if err := common.Unmarshal(request.PromptCacheKey, &key); err != nil {
+			return ""
+		}
+		return strings.TrimSpace(key)
+	}
+	return ""
+}
+
+// claudeMetadataSessionID 从 Claude metadata.user_id 里取会话 ID；取不到返回空串交给哈希兜底
+func claudeMetadataSessionID(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var metadata dto.ClaudeMetadata
+	if err := common.Unmarshal(raw, &metadata); err != nil {
+		return ""
+	}
+	userID := strings.TrimSpace(metadata.UserId)
+	if userID == "" {
+		return ""
+	}
+	if strings.HasPrefix(userID, "{") {
+		var nested struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := common.Unmarshal([]byte(userID), &nested); err != nil {
+			return ""
+		}
+		return strings.TrimSpace(nested.SessionID)
+	}
+	const sessionMarker = "_session_"
+	if idx := strings.LastIndex(userID, sessionMarker); idx >= 0 && idx+len(sessionMarker) < len(userID) {
+		return userID[idx+len(sessionMarker):]
+	}
+	return userID
+}
+
+// conversationHash 对 system 与首条 user 消息取 sha256 前 128 位作为对话标识
+func conversationHash(system, firstUser string) string {
+	if system == "" && firstUser == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(system + "\x00" + firstUser))
+	return hex.EncodeToString(sum[:16])
+}
+
+func claudeSystemText(request *dto.ClaudeRequest) string {
+	if request.System == nil {
+		return ""
+	}
+	if request.IsStringSystem() {
+		return request.GetStringSystem()
+	}
+	var builder strings.Builder
+	for _, block := range request.ParseSystem() {
+		builder.WriteString(block.GetText())
+	}
+	return builder.String()
+}
+
+func claudeFirstUserText(request *dto.ClaudeRequest) string {
+	for i := range request.Messages {
+		message := &request.Messages[i]
+		if message.Role != "user" {
+			continue
+		}
+		if message.IsStringContent() {
+			return message.GetStringContent()
+		}
+		blocks, err := message.ParseContent()
+		if err != nil {
+			return ""
+		}
+		var builder strings.Builder
+		for _, block := range blocks {
+			builder.WriteString(block.GetText())
+		}
+		return builder.String()
+	}
+	return ""
+}
+
+func openAIFirstMessageText(request *dto.GeneralOpenAIRequest, role string) string {
+	for i := range request.Messages {
+		if request.Messages[i].Role == role {
+			return request.Messages[i].StringContent()
+		}
+	}
+	return ""
 }
