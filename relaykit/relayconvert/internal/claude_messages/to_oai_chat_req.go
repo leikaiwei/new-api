@@ -178,10 +178,9 @@ func ClaudeMessagesRequestToOpenAIChat(claudeRequest dto.ClaudeRequest, info con
 					}
 					mediaMessages = append(mediaMessages, message)
 				case "image":
-					imageData := fmt.Sprintf("data:%s;base64,%s", mediaMsg.Source.MediaType, mediaMsg.Source.Data)
 					mediaMessage := dto.MediaContent{
 						Type:     "image_url",
-						ImageUrl: &dto.MessageImageUrl{Url: imageData},
+						ImageUrl: &dto.MessageImageUrl{Url: claudeImageURL(mediaMsg.Source)},
 					}
 					mediaMessages = append(mediaMessages, mediaMessage)
 				case "thinking":
@@ -211,9 +210,11 @@ func ClaudeMessagesRequestToOpenAIChat(claudeRequest dto.ClaudeRequest, info con
 					if mediaMsg.IsStringContent() {
 						oaiToolMessage.SetStringContent(mediaMsg.GetStringContent())
 					} else {
-						mediaContents := mediaMsg.ParseMediaContent()
-						encodedJSON, _ := kitutil.Marshal(mediaContents)
-						oaiToolMessage.SetStringContent(string(encodedJSON))
+						// 图片块摘到紧随 tool 消息之后的 user 消息里（mediaMessages 在本条消息末尾成为 user 消息），
+						// 既满足 OpenAI 对 tool 消息只能是文本的约束，又保住 tool_calls 与 tool 回复的相邻顺序。
+						toolText, images := splitToolResultImages(mediaMsg)
+						oaiToolMessage.SetStringContent(toolText)
+						mediaMessages = append(mediaMessages, images...)
 					}
 					openAIMessages = append(openAIMessages, oaiToolMessage)
 				}
@@ -239,6 +240,72 @@ func ClaudeMessagesRequestToOpenAIChat(claudeRequest dto.ClaudeRequest, info con
 
 	openAIRequest.Messages = openAIMessages
 	return &openAIRequest, nil
+}
+
+// claudeImageURL 把 Claude 的图片 source 转成 OpenAI image_url 可用的地址：url 型直接透传，base64 型拼 data URL。
+func claudeImageURL(source *dto.ClaudeMessageSource) string {
+	if source == nil {
+		return ""
+	}
+	if source.Url != "" {
+		return source.Url
+	}
+	data := kitutil.Interface2String(source.Data)
+	if data == "" {
+		return ""
+	}
+	return fmt.Sprintf("data:%s;base64,%s", source.MediaType, data)
+}
+
+// splitToolResultImages 处理内容为块数组的 tool_result。
+// OpenAI 的 tool 消息只能是文本，原先整个数组被 JSON 序列化塞进去，截图类工具返回的 image 块
+// 就成了几十万字符的 base64 文本，被上游按文本计 token（实测 ≈1.4 字节/token），几轮就撞满上下文窗口。
+// 这里把 image 块摘出来转成 image_url，由调用方放进紧随其后的 user 消息；tool 消息里留占位说明，
+// 每张图前加一条带 tool_use_id 的标注，便于并行调用时对应。不含 image 块时保持原有序列化行为不变。
+func splitToolResultImages(toolResult dto.ClaudeMediaMessage) (string, []dto.MediaContent) {
+	blocks := toolResult.ParseMediaContent()
+	hasImage := false
+	for _, block := range blocks {
+		if block.Type == "image" {
+			hasImage = true
+			break
+		}
+	}
+	if !hasImage {
+		encodedJSON, _ := kitutil.Marshal(blocks)
+		return string(encodedJSON), nil
+	}
+
+	texts := make([]string, 0, len(blocks))
+	rest := make([]dto.ClaudeMediaMessage, 0)
+	images := make([]dto.MediaContent, 0, 2)
+	imageCount := 0
+	for _, block := range blocks {
+		switch block.Type {
+		case "text":
+			if text := block.GetText(); text != "" {
+				texts = append(texts, text)
+			}
+		case "image":
+			url := claudeImageURL(block.Source)
+			if url == "" {
+				continue
+			}
+			imageCount++
+			images = append(images,
+				dto.MediaContent{Type: "text", Text: fmt.Sprintf("[Image from tool_result %s]", toolResult.ToolUseId)},
+				dto.MediaContent{Type: "image_url", ImageUrl: &dto.MessageImageUrl{Url: url}},
+			)
+		default:
+			rest = append(rest, block)
+		}
+	}
+	if len(rest) > 0 {
+		encodedJSON, _ := kitutil.Marshal(rest)
+		texts = append(texts, string(encodedJSON))
+	}
+	texts = append(texts, fmt.Sprintf("[%d image(s) from this tool result are attached in the following user message]", imageCount))
+	return strings.Join(texts, "\n"), images
 }
 
 func requestToJSONString(v interface{}) string {
