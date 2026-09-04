@@ -80,7 +80,7 @@ func TestRecalcQuotaFromRatiosRejectsAllInvalidAdjustedRatios(t *testing.T) {
 	assert.True(t, info.PriceData.HasOtherRatio("duration"))
 }
 
-func TestTextRequestViaResponsesConvertsClaudeDirectly(t *testing.T) {
+func TestTextRequestViaResponsesConvertsClaudeToResponses(t *testing.T) {
 	type capturedRequest struct {
 		path string
 		body []byte
@@ -136,7 +136,9 @@ func TestTextRequestViaResponsesConvertsClaudeDirectly(t *testing.T) {
 	require.Nil(t, apiErr)
 	require.NotNil(t, usage)
 	assert.Equal(t, 5, usage.TotalTokens)
-	assert.Equal(t, []relaytypes.RelayFormat{relaytypes.RelayFormatClaude, relaytypes.RelayFormatOpenAIResponses}, info.RequestConversionChain)
+	// Claude 入站先归一化成 chat 请求再升级到 Responses，参数覆盖脚本才能按渠道原本的
+	// chat/completions 语义生效，故转换链是三段。
+	assert.Equal(t, []relaytypes.RelayFormat{relaytypes.RelayFormatClaude, relaytypes.RelayFormatOpenAI, relaytypes.RelayFormatOpenAIResponses}, info.RequestConversionChain)
 
 	upstream := <-captured
 	assert.Equal(t, "/v1/responses", upstream.path)
@@ -152,4 +154,162 @@ func TestTextRequestViaResponsesConvertsClaudeDirectly(t *testing.T) {
 	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
 	require.Len(t, response.Content, 1)
 	assert.Equal(t, "ok", response.Content[0].GetText())
+}
+
+// museEffortOverride 复刻生产上 muse 渠道的降档规则：客户端未明确要求思考时把
+// chat 语义的 reasoning_effort 降到最低档。
+func museEffortOverride() map[string]interface{} {
+	return map[string]interface{}{
+		"operations": []interface{}{
+			map[string]interface{}{
+				"mode":  "set",
+				"path":  "reasoning_effort",
+				"value": "minimal",
+				"logic": "AND",
+				"conditions": []interface{}{
+					map[string]interface{}{"mode": "contains", "path": "upstream_model", "value": "muse-spark"},
+					map[string]interface{}{"mode": "full", "path": "client_thinking_type", "value": "enabled", "invert": true},
+					map[string]interface{}{"mode": "full", "path": "client_thinking_type", "value": "adaptive", "invert": true},
+				},
+			},
+		},
+	}
+}
+
+func newResponsesUpgradeInfo(baseURL string, format relaytypes.RelayFormat) *relaycommon.RelayInfo {
+	return &relaycommon.RelayInfo{
+		RelayMode:              relayconstant.RelayModeChatCompletions,
+		RelayFormat:            format,
+		OriginModelName:        "muse-spark-1.3",
+		RequestConversionChain: []relaytypes.RelayFormat{format},
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:       constant.ChannelTypeOpenAI,
+			ChannelBaseUrl:    baseURL,
+			ApiKey:            "test-key",
+			UpstreamModelName: "muse-spark-1.3-contributor",
+			ParamOverride:     museEffortOverride(),
+		},
+	}
+}
+
+func newResponsesUpgradeServer(t *testing.T, captured chan<- []byte) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		captured <- body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_1",
+			"object":"response",
+			"status":"completed",
+			"model":"muse-spark-1.3-contributor",
+			"output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],
+			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
+		}`))
+	}))
+}
+
+// 参数覆盖脚本按渠道原本的 chat/completions 语义书写，协议升级到 Responses 是网关单方面的
+// 行为。Claude 入站必须和 OpenAI 入站一样先归一化成 chat 请求再套规则，否则 chat 语义的
+// reasoning_effort 会原样落到 Responses 请求顶层，被上游判为未知参数直接 400。
+func TestTextRequestViaResponsesAppliesParamOverrideOnChatSemantics(t *testing.T) {
+	claudeRequest := &dto.ClaudeRequest{
+		Model:    "muse-spark-1.3",
+		Messages: []dto.ClaudeMessage{{Role: "user", Content: "hello"}},
+	}
+	openaiRequest := &dto.GeneralOpenAIRequest{
+		Model:    "muse-spark-1.3",
+		Messages: []dto.Message{{Role: "user", Content: "hello"}},
+	}
+
+	tests := []struct {
+		name      string
+		format    relaytypes.RelayFormat
+		path      string
+		request   any
+		wantChain []relaytypes.RelayFormat
+	}{
+		{
+			name:      "claude input",
+			format:    relaytypes.RelayFormatClaude,
+			path:      "/v1/messages",
+			request:   claudeRequest,
+			wantChain: []relaytypes.RelayFormat{relaytypes.RelayFormatClaude, relaytypes.RelayFormatOpenAI, relaytypes.RelayFormatOpenAIResponses},
+		},
+		{
+			name:      "openai input",
+			format:    relaytypes.RelayFormatOpenAI,
+			path:      "/v1/chat/completions",
+			request:   openaiRequest,
+			wantChain: []relaytypes.RelayFormat{relaytypes.RelayFormatOpenAI, relaytypes.RelayFormatOpenAIResponses},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			captured := make(chan []byte, 1)
+			server := newResponsesUpgradeServer(t, captured)
+			defer server.Close()
+
+			gin.SetMode(gin.TestMode)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, tt.path, nil)
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			info := newResponsesUpgradeInfo(server.URL, tt.format)
+			// client_thinking_type 只在 Claude 请求上有值，OpenAI 入站时该条件路径缺失。
+			if claudeReq, ok := tt.request.(*dto.ClaudeRequest); ok {
+				info.Request = claudeReq
+			}
+			adaptor := &openaichannel.Adaptor{}
+			adaptor.Init(info)
+
+			usage, apiErr := textRequestViaResponses(c, info, adaptor, tt.request)
+			require.Nil(t, apiErr)
+			require.NotNil(t, usage)
+			assert.Equal(t, tt.wantChain, info.RequestConversionChain)
+
+			var upstreamBody map[string]any
+			require.NoError(t, common.Unmarshal(<-captured, &upstreamBody))
+			assert.NotContains(t, upstreamBody, "reasoning_effort", "chat 语义字段不能出现在 Responses 请求顶层")
+			assert.NotContains(t, upstreamBody, "messages")
+		})
+	}
+}
+
+// Claude 入站时 client_thinking_type 可用，降档规则命中后必须体现在 Responses 的
+// reasoning.effort 上，而不是被丢弃。
+func TestTextRequestViaResponsesFoldsOverriddenEffortIntoReasoning(t *testing.T) {
+	captured := make(chan []byte, 1)
+	server := newResponsesUpgradeServer(t, captured)
+	defer server.Close()
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	request := &dto.ClaudeRequest{
+		Model:    "muse-spark-1.3",
+		Messages: []dto.ClaudeMessage{{Role: "user", Content: "hello"}},
+	}
+	info := newResponsesUpgradeInfo(server.URL, relaytypes.RelayFormatClaude)
+	info.Request = request
+	adaptor := &openaichannel.Adaptor{}
+	adaptor.Init(info)
+
+	_, apiErr := textRequestViaResponses(c, info, adaptor, request)
+	require.Nil(t, apiErr)
+
+	var upstreamBody map[string]any
+	require.NoError(t, common.Unmarshal(<-captured, &upstreamBody))
+	reasoning, ok := upstreamBody["reasoning"].(map[string]any)
+	require.True(t, ok, "降档规则命中后应产生 Responses 的 reasoning 对象")
+	assert.Equal(t, "minimal", reasoning["effort"])
 }
