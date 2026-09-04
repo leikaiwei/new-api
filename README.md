@@ -107,6 +107,17 @@ Fork 自 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)，在上�
 - 回归三层：`claude_messages` 单测（文本+图片、并行两图的顺序与 id 对应、同消息自带文本的排序、url 型 source、无图片对照）；`relayconvert` 走生产入口 `ConvertRequest` 断言消息顺序，且出站 JSON 里 base64 只出现在 `image_url` 一处；`dto` 断言图片进 Files、base64 不进文本。**回退两处修复后 7 个图片用例全部失败、无图片对照仍通过，非静态推断**
 - 上游状态：尚未反馈
 
+**#9 Claude 入站走 chat→Responses 升级策略时，参数覆盖落到了 Responses 请求体上** — `relay/chat_completions_via_responses.go`
+
+- 症状：渠道命中 `chat_completions_to_responses_policy` 后，Claude 入口（`/v1/messages`）的请求被上游 400 `unknown parameter \`reasoning_effort\``；同渠道同模型走 OpenAI 入口（`/v1/chat/completions`）一切正常。生产实测四种入站形状：Claude + 未传 thinking、Claude + `disabled` 均 400，Claude + `enabled`（规则不命中）、OpenAI 入站均 200
+- 根因：`textRequestViaResponses` 只在 `request` 断言为 `*dto.GeneralOpenAIRequest` 时于 chat 阶段套 `param_override`。上游把 Claude 入站改成直转 Responses 后，传进来的是 `*dto.ClaudeRequest`，断言不成立 → 整段跳过 → 落到函数尾部那段兜底，在**已经是 Responses 结构**的请求体上应用规则。渠道脚本按 chat 语义书写（Responses 里对应的是 `reasoning.effort`），`set reasoning_effort` 于是原样出现在 Responses 顶层
+- 隐蔽点：`request_conversion` 从三段 `[Claude Messages, OpenAI Compatible, OpenAI Responses]` 缩成两段 `[Claude Messages, OpenAI Responses]` 是唯一的外部可见信号，而该路径原先不打出站 `requestBody` 日志，只能靠上游报错文本反推
+- 修复：非 chat 入站先 `ConvertRequest(RelayFormatOpenAI)` 归一化成 chat 请求，再统一走原有的「chat 上套规则 → 转 Responses」流程，两条入站路径语义一致；尾部那段兜底应用随之恒不成立，一并移除
+- 代价（有意接受）：转换链多一段 `openai`；`tool_result` 里的图片改走补丁 #8 的「占位 + 追加 user 消息」形式，不再使用 Responses 原生的 `function_call_output` + `input_image`。后者更干净，但前者是线上已验证的形式，且 08-20～09-03 期间这条链路本就是三段的
+- 顺带：给 `relayResponsesRequest` 补上出站 `requestBody` 的 DEBUG 日志，与其它 relay 路径对齐
+- 回归：表驱动覆盖 Claude / OpenAI 两种入站，断言出站 Responses 体顶层不含 `reasoning_effort`；另一条断言降档规则命中后落在 `reasoning.effort`。**回退修复后 Claude 那格必失败（出站体里能直接看到顶层 `reasoning_effort`）、OpenAI 那格仍通过**，非静态推断
+- 上游状态：尚未反馈
+
 **CI：fork 专用 GHCR 镜像构建** — `.github/workflows/fork-ghcr-release.yml`
 
 - 发布 release 时自动构建 amd64 + arm64 推送到 `ghcr.io/leikaiwei/new-api`，不走 Docker Hub
