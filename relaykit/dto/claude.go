@@ -330,8 +330,39 @@ func (c *ClaudeRequest) GetTokenCountMeta() *types.TokenCountMeta {
 					texts = append(texts, string(b))
 				}
 			case "tool_result":
-				if media.Content != nil {
+				if media.Content == nil {
+					continue
+				}
+				// 与 Claude→OpenAI 转换保持一致：tool_result 里的 image 块按图片计，不再当 base64 文本估；
+				// 其余块（含不带图片的整个数组）沿用整体序列化。
+				blocks := media.ParseMediaContent()
+				hasImage := false
+				for _, block := range blocks {
+					if block.Type == "image" {
+						hasImage = true
+						break
+					}
+				}
+				if !hasImage {
 					b, _ := kitutil.Marshal(media.Content)
+					texts = append(texts, string(b))
+					continue
+				}
+				rest := make([]ClaudeMediaMessage, 0, len(blocks))
+				for _, block := range blocks {
+					if block.Type != "image" {
+						rest = append(rest, block)
+						continue
+					}
+					if source := block.ToFileSource(); source != nil {
+						fileMeta = append(fileMeta, &types.FileMeta{
+							FileType: types.FileTypeImage,
+							Source:   source,
+						})
+					}
+				}
+				if len(rest) > 0 {
+					b, _ := kitutil.Marshal(rest)
 					texts = append(texts, string(b))
 				}
 			}
