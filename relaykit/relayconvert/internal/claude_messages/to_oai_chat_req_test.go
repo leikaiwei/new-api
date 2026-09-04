@@ -214,3 +214,121 @@ func TestClaudeMessagesRequestToOpenAIChatOmitsReasoningContentWithoutToolCalls(
 	require.NoError(t, err)
 	assert.False(t, strings.Contains(string(encoded), "reasoning_content"))
 }
+
+// OpenAI 的 tool 消息只能是文本。tool_result 里的 image 块原先被整体 JSON 序列化，
+// 截图类工具的一张图就是几十万字符的 base64 文本，上游按文本计 token（≈1.4 字节/token），
+// 几轮就撞满上下文窗口。现在图片摘到紧随其后的 user 消息里以 image_url 发送。
+func TestClaudeMessagesRequestToOpenAIChatToolResultImages(t *testing.T) {
+	const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+	image := func(mediaType, data string) string {
+		return `{"type":"image","source":{"type":"base64","media_type":"` + mediaType + `","data":"` + data + `"}}`
+	}
+	convert := func(t *testing.T, body string) *dto.GeneralOpenAIRequest {
+		var claudeRequest dto.ClaudeRequest
+		require.NoError(t, kitutil.UnmarshalJsonStr(body, &claudeRequest))
+		openAIRequest, err := ClaudeMessagesRequestToOpenAIChat(claudeRequest, nil)
+		require.NoError(t, err)
+		return openAIRequest
+	}
+	imageURL := func(t *testing.T, part dto.MediaContent) string {
+		require.Equal(t, "image_url", part.Type)
+		media := part.GetImageMedia()
+		require.NotNil(t, media)
+		return media.Url
+	}
+
+	t.Run("文本加图片：tool 消息只留文本与占位，图片进随后的 user 消息", func(t *testing.T) {
+		req := convert(t, `{"model":"mimo-v2.5","messages":[
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"toolu_1","content":[
+					{"type":"text","text":"screenshot taken"},
+					`+image("image/png", png)+`
+				]}
+			]}
+		]}`)
+		require.Len(t, req.Messages, 2)
+
+		tool := req.Messages[0]
+		assert.Equal(t, "tool", tool.Role)
+		assert.Equal(t, "toolu_1", tool.ToolCallId)
+		toolText := tool.StringContent()
+		assert.Contains(t, toolText, "screenshot taken")
+		assert.Contains(t, toolText, "1 image(s)")
+		assert.NotContains(t, toolText, png, "base64 不得留在 tool 消息文本里")
+		assert.NotContains(t, toolText, `"type":"image"`, "不得再整体序列化图片块")
+
+		user := req.Messages[1]
+		assert.Equal(t, "user", user.Role)
+		parts := user.ParseContent()
+		require.Len(t, parts, 2)
+		assert.Equal(t, "text", parts[0].Type)
+		assert.Contains(t, parts[0].Text, "toolu_1")
+		assert.Equal(t, "data:image/png;base64,"+png, imageURL(t, parts[1]))
+	})
+
+	t.Run("并行两个带图的 tool_result：tool 消息相邻，图片按顺序合进一条 user 消息", func(t *testing.T) {
+		req := convert(t, `{"model":"mimo-v2.5","messages":[
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"toolu_a","content":[`+image("image/png", "AAAA")+`]},
+				{"type":"tool_result","tool_use_id":"toolu_b","content":[`+image("image/jpeg", "BBBB")+`]}
+			]}
+		]}`)
+		require.Len(t, req.Messages, 3)
+		assert.Equal(t, "tool", req.Messages[0].Role)
+		assert.Equal(t, "toolu_a", req.Messages[0].ToolCallId)
+		assert.Equal(t, "tool", req.Messages[1].Role)
+		assert.Equal(t, "toolu_b", req.Messages[1].ToolCallId)
+
+		parts := req.Messages[2].ParseContent()
+		require.Equal(t, "user", req.Messages[2].Role)
+		require.Len(t, parts, 4)
+		assert.Contains(t, parts[0].Text, "toolu_a")
+		assert.Equal(t, "data:image/png;base64,AAAA", imageURL(t, parts[1]))
+		assert.Contains(t, parts[2].Text, "toolu_b")
+		assert.Equal(t, "data:image/jpeg;base64,BBBB", imageURL(t, parts[3]))
+	})
+
+	t.Run("同条 user 消息自带文本：图片标注在前、用户文本在后", func(t *testing.T) {
+		req := convert(t, `{"model":"mimo-v2.5","messages":[
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"toolu_1","content":[`+image("image/png", "AAAA")+`]},
+				{"type":"text","text":"what do you see"}
+			]}
+		]}`)
+		require.Len(t, req.Messages, 2)
+		parts := req.Messages[1].ParseContent()
+		require.Len(t, parts, 3)
+		assert.Equal(t, "image_url", parts[1].Type)
+		assert.Equal(t, "what do you see", parts[2].Text)
+	})
+
+	t.Run("url 型图片 source 直接透传地址", func(t *testing.T) {
+		req := convert(t, `{"model":"mimo-v2.5","messages":[
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"toolu_1","content":[
+					{"type":"image","source":{"type":"url","url":"https://example.com/shot.png"}}
+				]}
+			]}
+		]}`)
+		require.Len(t, req.Messages, 2)
+		parts := req.Messages[1].ParseContent()
+		require.Len(t, parts, 2)
+		assert.Equal(t, "https://example.com/shot.png", imageURL(t, parts[1]))
+	})
+
+	t.Run("不含图片的块数组保持原有整体序列化行为", func(t *testing.T) {
+		req := convert(t, `{"model":"mimo-v2.5","messages":[
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"toolu_1","content":[
+					{"type":"text","text":"line one"},
+					{"type":"text","text":"line two"}
+				]}
+			]}
+		]}`)
+		require.Len(t, req.Messages, 1, "没有图片就不该多出 user 消息")
+		toolText := req.Messages[0].StringContent()
+		assert.Contains(t, toolText, `"type":"text"`)
+		assert.Contains(t, toolText, "line one")
+		assert.NotContains(t, toolText, "image(s)")
+	})
+}
