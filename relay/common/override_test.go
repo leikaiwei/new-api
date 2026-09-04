@@ -2632,3 +2632,135 @@ func TestBuildParamOverrideContextClientThinking(t *testing.T) {
 		})
 	}
 }
+
+// 上游网关（如 opencode 的 X-Opencode-Session）要求每个请求带跨轮稳定的对话 ID。
+// 跨格式转换会丢弃 metadata，所以对话 ID 必须在上下文里推导好，供 set_header 模板引用。
+func TestBuildParamOverrideContextClientSessionID(t *testing.T) {
+	const sessionUUID = "38a561c9-4aae-4d1e-a244-d4b1e83ec173"
+	claudeJSONMetadata := json.RawMessage(`{"user_id":"{\"device_id\":\"fe585dd3\",\"account_uuid\":\"\",\"session_id\":\"` + sessionUUID + `\"}"}`)
+
+	cases := []struct {
+		name    string
+		headers map[string]string
+		request dto.Request
+		want    any // nil 表示上下文里不应有该字段
+	}{
+		{
+			name:    "入站 x-claude-code-session-id 头优先",
+			headers: map[string]string{"X-Claude-Code-Session-Id": " " + sessionUUID + " "},
+			request: &dto.ClaudeRequest{Metadata: json.RawMessage(`{"user_id":"other"}`)},
+			want:    sessionUUID,
+		},
+		{
+			name:    "新版 Claude Code：metadata.user_id 是含 session_id 的 JSON 串",
+			request: &dto.ClaudeRequest{Metadata: claudeJSONMetadata},
+			want:    sessionUUID,
+		},
+		{
+			name:    "旧版 Claude Code：user_<hash>_account_<uuid>_session_<uuid>",
+			request: &dto.ClaudeRequest{Metadata: json.RawMessage(`{"user_id":"user_abc_account_11111111-1111-1111-1111-111111111111_session_` + sessionUUID + `"}`)},
+			want:    sessionUUID,
+		},
+		{
+			name:    "其他形态的 user_id 原样使用",
+			request: &dto.ClaudeRequest{Metadata: json.RawMessage(`{"user_id":"tenant-42"}`)},
+			want:    "tenant-42",
+		},
+		{
+			name:    "JSON 串里没有 session_id 时退到对话哈希，而不是拿设备 ID 充数",
+			request: &dto.ClaudeRequest{Metadata: json.RawMessage(`{"user_id":"{\"device_id\":\"fe585dd3\"}"}`), System: "s", Messages: []dto.ClaudeMessage{{Role: "user", Content: "hi"}}},
+			want:    conversationHash("s", "hi"),
+		},
+		{
+			name:    "OpenAI 请求优先用 prompt_cache_key",
+			request: &dto.GeneralOpenAIRequest{PromptCacheKey: "my-app", Messages: []dto.Message{{Role: "user", Content: "hi"}}},
+			want:    "my-app",
+		},
+		{
+			name:    "OpenAI 请求无 key 时退到 system+首条 user 哈希",
+			request: &dto.GeneralOpenAIRequest{Messages: []dto.Message{{Role: "system", Content: "s"}, {Role: "user", Content: "hi"}}},
+			want:    conversationHash("s", "hi"),
+		},
+		{
+			name:    "Responses 请求用 prompt_cache_key",
+			request: &dto.OpenAIResponsesRequest{PromptCacheKey: json.RawMessage(`"resp-key"`)},
+			want:    "resp-key",
+		},
+		{
+			name:    "什么都没有时不透出该字段，模板解析为空、不会发出空头",
+			request: &dto.ClaudeRequest{},
+			want:    nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := BuildParamOverrideContext(&RelayInfo{Request: tc.request, RequestHeaders: tc.headers})
+			if tc.want == nil {
+				assert.NotContains(t, ctx, "client_session_id")
+				return
+			}
+			assert.Equal(t, tc.want, ctx["client_session_id"])
+		})
+	}
+}
+
+// 兜底哈希只看 system 与首条 user 消息：对话历史只追加，所以同一对话各轮取值必须一致；
+// 首条消息不同的对话必须分开；同一文本的字符串形态与内容块形态必须等价（客户端会在轮次间翻转形态）。
+func TestClientSessionIDHashStableAcrossTurns(t *testing.T) {
+	system := []dto.ClaudeMediaMessage{{Type: "text", Text: lo.ToPtr("You are Claude Code.")}}
+	turn1 := &dto.ClaudeRequest{System: system, Messages: []dto.ClaudeMessage{{Role: "user", Content: "fix the bug"}}}
+	turn3 := &dto.ClaudeRequest{System: system, Messages: []dto.ClaudeMessage{
+		{Role: "user", Content: []any{map[string]any{"type": "text", "text": "fix the bug"}}},
+		{Role: "assistant", Content: "looking"},
+		{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}}},
+	}}
+	other := &dto.ClaudeRequest{System: system, Messages: []dto.ClaudeMessage{{Role: "user", Content: "write docs"}}}
+
+	first := clientSessionID(&RelayInfo{Request: turn1})
+	require.Len(t, first, 32)
+	assert.Equal(t, first, clientSessionID(&RelayInfo{Request: turn3}), "同一对话后续轮次必须得到同一 ID")
+	assert.NotEqual(t, first, clientSessionID(&RelayInfo{Request: other}), "不同对话必须分开")
+}
+
+// set_header 的值支持 ${变量} 引用覆盖上下文，端到端走 ApplyParamOverrideWithRelayInfo，
+// 断言最终落到运行时请求头覆盖里的取值。
+func TestApplyParamOverrideSetHeaderTemplate(t *testing.T) {
+	const sessionUUID = "07633690-0d1e-4c2f-9a11-3b6f4c2d8e90"
+	newInfo := func(value string) *RelayInfo {
+		return &RelayInfo{
+			Request: &dto.ClaudeRequest{Metadata: json.RawMessage(`{"user_id":"{\"session_id\":\"` + sessionUUID + `\"}"}`)},
+			ChannelMeta: &ChannelMeta{ParamOverride: map[string]interface{}{
+				"operations": []interface{}{
+					map[string]interface{}{"mode": "set_header", "path": "X-Opencode-Session", "value": value},
+				},
+			}},
+		}
+	}
+
+	cases := []struct {
+		name  string
+		value string
+		want  string // 空串表示不应设置该头
+	}{
+		{name: "整值引用", value: "${client_session_id}", want: sessionUUID},
+		{name: "与静态前缀拼接", value: "newapi-${client_session_id}", want: "newapi-" + sessionUUID},
+		{name: "未定义变量解析为空、不发空头", value: "${no_such_var}", want: ""},
+		{name: "静态值不受影响", value: "static", want: "static"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info := newInfo(tc.value)
+			_, err := ApplyParamOverrideWithRelayInfo([]byte(`{"model":"mimo-v2.5"}`), info)
+			require.NoError(t, err)
+			require.True(t, info.UseRuntimeHeadersOverride)
+			got, exists := info.RuntimeHeadersOverride["x-opencode-session"]
+			if tc.want == "" {
+				assert.False(t, exists, "不应设置该请求头，实际: %v", got)
+				return
+			}
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
