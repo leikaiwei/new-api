@@ -96,6 +96,17 @@ Fork 自 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)，在上�
 - 回归：推导四种来源与「无 ID 不发空头」各一例、哈希在轮次增长与内容块形态翻转下不变、`set_header` 模板端到端走 `ApplyParamOverrideWithRelayInfo` 断言运行时请求头。**回退 `set_header` 那一行后模板三例全部失败，非静态推断**
 - 上游状态：尚未反馈
 
+**#8 tool_result 里的图片块被 JSON 序列化成 base64 文本发给上游，单轮 prompt 暴涨数十万 token** — `relaykit/relayconvert/internal/claude_messages/to_oai_chat_req.go`
+
+- 症状：Claude Code 用截图 / 读图类工具后，下一轮 `prompt_tokens` 从 8 万跳到 56 万，几轮内撞满 1M 上下文窗口。之后 GLM 类上游 400 `Prompt exceeds max length`；mimo 类上游 hang 100–300 秒后回 `finish_reason=length`、内容空、`prompt_tokens=1048570`（上游饱和值，两家网关同值），经 new-api 映射成 `stop_reason=max_tokens`，客户端报 "exceeded 64000 output token maximum"
+- 根因：OpenAI 的 tool 消息内容只能是文本，转换对内容为块数组的 tool_result 一律 `Marshal` 成 JSON 字符串。截图工具返回的 `image` 块因此变成 `[{"type":"image","source":{"type":"base64",…,"data":"<30–68 万字符>"}}]` 的纯文本，上游按文本 tokenize（实测 ≈1.4 字节/token，+682 KB → +486k token）。生产日志实证：三个会话 13 个这样的块，单块 233–681 KB，png 与 jpeg 都有
+- 修复：含 `image` 块的 tool_result，文本块留在 tool 消息里并追加一行占位说明；`image` 块转成 `image_url`（base64 拼 data URL，url 型透传）放进紧随其后的 user 消息，每张图前加带 `tool_use_id` 的标注便于并行调用对应。既满足 tool 消息只能是文本的约束，又保住 assistant(tool_calls) → tool 回复相邻的顺序。**不含 `image` 块的 tool_result 行为完全不变**（仍整体序列化，有对照测试锁定）
+- 顺带：顶层 `image` 块与新逻辑共用同一个 URL 构造函数，base64 输出逐字节相同；`source.type=url` 的图片原先会拼成 `data:;base64,` 的坏地址，现在直接透传 URL
+- 估算口径同步：入口 prompt 估算（`relaykit/dto/claude.go` `GetTokenCountMeta`）原先也把 tool_result 整体当文本，base64 按字符类启发式估成真值的一半左右（复算 32 万 vs 上游 56.7 万，`message_start.usage.input_tokens` 由此偏低）；现在 tool_result 里的 `image` 块按图片计入 Files，与出站形状一致
+- 前提实测：用 1×1 PNG 的 `image_url` 直接打生产两条链路，mimo-v2.5（opencode）回答 "Red."，glm-5.3-flash（tuanjie）200 接受。两家都不拒绝图片输入，转成 `image_url` 不会引入新的 400
+- 回归三层：`claude_messages` 单测（文本+图片、并行两图的顺序与 id 对应、同消息自带文本的排序、url 型 source、无图片对照）；`relayconvert` 走生产入口 `ConvertRequest` 断言消息顺序，且出站 JSON 里 base64 只出现在 `image_url` 一处；`dto` 断言图片进 Files、base64 不进文本。**回退两处修复后 7 个图片用例全部失败、无图片对照仍通过，非静态推断**
+- 上游状态：尚未反馈
+
 **CI：fork 专用 GHCR 镜像构建** — `.github/workflows/fork-ghcr-release.yml`
 
 - 发布 release 时自动构建 amd64 + arm64 推送到 `ghcr.io/leikaiwei/new-api`，不走 Docker Hub
