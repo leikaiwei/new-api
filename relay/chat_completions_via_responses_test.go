@@ -156,8 +156,9 @@ func TestTextRequestViaResponsesConvertsClaudeToResponses(t *testing.T) {
 	assert.Equal(t, "ok", response.Content[0].GetText())
 }
 
-// museEffortOverride 复刻生产上 muse 渠道的降档规则：客户端未明确要求思考时把
-// chat 语义的 reasoning_effort 降到最低档。
+// museEffortOverride 复刻生产上 muse 渠道的两类规则：chat 语义的 reasoning_effort 降档，
+// 以及 set_header 注入对话 ID（上游 opencode 要求每个请求带）。后者不作用于请求体，
+// 必须随规则应用时机一起搬动，否则协议升级路径上会静默丢头。
 func museEffortOverride() map[string]interface{} {
 	return map[string]interface{}{
 		"operations": []interface{}{
@@ -171,6 +172,11 @@ func museEffortOverride() map[string]interface{} {
 					map[string]interface{}{"mode": "full", "path": "client_thinking_type", "value": "enabled", "invert": true},
 					map[string]interface{}{"mode": "full", "path": "client_thinking_type", "value": "adaptive", "invert": true},
 				},
+			},
+			map[string]interface{}{
+				"mode":  "set_header",
+				"path":  "X-Opencode-Session",
+				"value": "${client_session_id}",
 			},
 		},
 	}
@@ -192,7 +198,7 @@ func newResponsesUpgradeInfo(baseURL string, format relaytypes.RelayFormat) *rel
 	}
 }
 
-func newResponsesUpgradeServer(t *testing.T, captured chan<- []byte) *httptest.Server {
+func newResponsesUpgradeServer(t *testing.T, captured chan<- []byte, capturedHeader chan<- string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -200,6 +206,7 @@ func newResponsesUpgradeServer(t *testing.T, captured chan<- []byte) *httptest.S
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		capturedHeader <- r.Header.Get("X-Opencode-Session")
 		captured <- body
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
@@ -252,7 +259,8 @@ func TestTextRequestViaResponsesAppliesParamOverrideOnChatSemantics(t *testing.T
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			captured := make(chan []byte, 1)
-			server := newResponsesUpgradeServer(t, captured)
+			capturedHeader := make(chan string, 1)
+			server := newResponsesUpgradeServer(t, captured, capturedHeader)
 			defer server.Close()
 
 			gin.SetMode(gin.TestMode)
@@ -262,9 +270,13 @@ func TestTextRequestViaResponsesAppliesParamOverrideOnChatSemantics(t *testing.T
 			c.Request.Header.Set("Content-Type", "application/json")
 
 			info := newResponsesUpgradeInfo(server.URL, tt.format)
-			// client_thinking_type 只在 Claude 请求上有值，OpenAI 入站时该条件路径缺失。
-			if claudeReq, ok := tt.request.(*dto.ClaudeRequest); ok {
-				info.Request = claudeReq
+			// client_session_id 由 info.Request 推导，两种入站都要挂上；
+			// client_thinking_type 则只在 Claude 请求上有值，OpenAI 入站时该条件路径缺失。
+			switch req := tt.request.(type) {
+			case *dto.ClaudeRequest:
+				info.Request = req
+			case *dto.GeneralOpenAIRequest:
+				info.Request = req
 			}
 			adaptor := &openaichannel.Adaptor{}
 			adaptor.Init(info)
@@ -278,6 +290,8 @@ func TestTextRequestViaResponsesAppliesParamOverrideOnChatSemantics(t *testing.T
 			require.NoError(t, common.Unmarshal(<-captured, &upstreamBody))
 			assert.NotContains(t, upstreamBody, "reasoning_effort", "chat 语义字段不能出现在 Responses 请求顶层")
 			assert.NotContains(t, upstreamBody, "messages")
+			// set_header 不作用于请求体，规则应用时机变化不能把它丢掉。
+			assert.NotEmpty(t, <-capturedHeader, "set_header 注入的对话 ID 必须出现在出站请求头上")
 		})
 	}
 }
@@ -286,7 +300,8 @@ func TestTextRequestViaResponsesAppliesParamOverrideOnChatSemantics(t *testing.T
 // reasoning.effort 上，而不是被丢弃。
 func TestTextRequestViaResponsesFoldsOverriddenEffortIntoReasoning(t *testing.T) {
 	captured := make(chan []byte, 1)
-	server := newResponsesUpgradeServer(t, captured)
+	capturedHeader := make(chan string, 1)
+	server := newResponsesUpgradeServer(t, captured, capturedHeader)
 	defer server.Close()
 
 	gin.SetMode(gin.TestMode)
