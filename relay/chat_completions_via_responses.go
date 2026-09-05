@@ -73,43 +73,37 @@ func applySystemPromptIfNeeded(c *gin.Context, info *relaycommon.RelayInfo, requ
 
 func textRequestViaResponses(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.Adaptor, request any) (*dto.Usage, *types.NewAPIError) {
 	// 参数覆盖脚本按渠道原本的 chat/completions 语义书写，升级到 Responses 是网关单方面的行为。
-	// 非 chat 入站（如 Claude Messages）先归一化成 chat 请求，规则才不会落到 Responses 结构上
-	// —— 顶层 reasoning_effort 之类会被上游判为未知参数直接 400。
-	chatRequest, ok := request.(*dto.GeneralOpenAIRequest)
-	if !ok {
-		result, err := service.ConvertRequest(c, info, types.RelayFormatOpenAI, request)
+	// chat 入站在 chat 体上套完规则再升级；Claude 等非 chat 入站直转 Responses（保住原生的
+	// function_call_output + input_image，也不产生空 assistant 占位），规则改在 Responses 体上
+	// 经 chat→Responses 键翻译后应用，否则顶层 reasoning_effort 会被上游判为未知参数直接 400。
+	paramOverrideApplied := false
+	if chatRequest, ok := request.(*dto.GeneralOpenAIRequest); ok {
+		chatJSON, err := common.Marshal(chatRequest)
 		if err != nil {
-			return nil, newConvertRequestFailedError(c, info, err)
+			return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 		}
-		chatRequest, ok = result.Value.(*dto.GeneralOpenAIRequest)
-		if !ok {
-			return nil, types.NewError(fmt.Errorf("expected OpenAI chat completions request, got %T", result.Value), types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
-		}
-	}
 
-	chatJSON, err := common.Marshal(chatRequest)
-	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
-	}
-
-	chatJSON, err = relaycommon.RemoveDisabledFields(chatJSON, info.ChannelOtherSettings, info.ChannelSetting.PassThroughBodyEnabled)
-	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
-	}
-
-	if len(info.ParamOverride) > 0 {
-		chatJSON, err = relaycommon.ApplyParamOverrideWithRelayInfo(chatJSON, info)
+		chatJSON, err = relaycommon.RemoveDisabledFields(chatJSON, info.ChannelOtherSettings, info.ChannelSetting.PassThroughBodyEnabled)
 		if err != nil {
-			return nil, newAPIErrorFromParamOverride(err)
+			return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 		}
+
+		if len(info.ParamOverride) > 0 {
+			chatJSON, err = relaycommon.ApplyParamOverrideWithRelayInfo(chatJSON, info)
+			if err != nil {
+				return nil, newAPIErrorFromParamOverride(err)
+			}
+			paramOverrideApplied = true
+		}
+
+		var overriddenChatReq dto.GeneralOpenAIRequest
+		if err := common.Unmarshal(chatJSON, &overriddenChatReq); err != nil {
+			return nil, types.NewError(err, types.ErrorCodeChannelParamOverrideInvalid, types.ErrOptionWithSkipRetry())
+		}
+		request = &overriddenChatReq
 	}
 
-	var overriddenChatReq dto.GeneralOpenAIRequest
-	if err := common.Unmarshal(chatJSON, &overriddenChatReq); err != nil {
-		return nil, types.NewError(err, types.ErrorCodeChannelParamOverrideInvalid, types.ErrOptionWithSkipRetry())
-	}
-
-	result, err := service.ConvertRequest(c, info, types.RelayFormatOpenAIResponses, &overriddenChatReq)
+	result, err := service.ConvertRequest(c, info, types.RelayFormatOpenAIResponses, request)
 	if err != nil {
 		return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 	}
@@ -117,10 +111,10 @@ func textRequestViaResponses(c *gin.Context, info *relaycommon.RelayInfo, adapto
 	if !ok {
 		return nil, types.NewError(fmt.Errorf("expected OpenAI responses request, got %T", result.Value), types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 	}
-	return relayResponsesRequest(c, info, adaptor, responsesReq)
+	return relayResponsesRequest(c, info, adaptor, responsesReq, paramOverrideApplied)
 }
 
-func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.Adaptor, responsesReq *dto.OpenAIResponsesRequest) (*dto.Usage, *types.NewAPIError) {
+func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.Adaptor, responsesReq *dto.OpenAIResponsesRequest, paramOverrideApplied bool) (*dto.Usage, *types.NewAPIError) {
 	savedRelayMode := info.RelayMode
 	savedRequestURLPath := info.RequestURLPath
 	defer func() {
@@ -145,6 +139,12 @@ func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor 
 	jsonData, err = relaycommon.RemoveDisabledFields(jsonData, info.ChannelOtherSettings, info.ChannelSetting.PassThroughBodyEnabled)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+	}
+	if !paramOverrideApplied && len(info.ParamOverride) > 0 {
+		jsonData, err = relaycommon.ApplyChatParamOverrideOnResponses(jsonData, info)
+		if err != nil {
+			return nil, newAPIErrorFromParamOverride(err)
+		}
 	}
 
 	logger.LogDebug(c, "requestBody: %s", jsonData)

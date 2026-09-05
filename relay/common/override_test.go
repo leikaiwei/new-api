@@ -2764,3 +2764,90 @@ func TestApplyParamOverrideSetHeaderTemplate(t *testing.T) {
 		})
 	}
 }
+
+// 协议升级到 Responses 时，chat 语义的规则要落到 Responses 的对应路径上；
+// reasoning.effort 由规则新建时补 summary=detailed，与转换器自身的行为一致。
+func TestApplyChatParamOverrideOnResponses(t *testing.T) {
+	setEffort := func(value string) map[string]interface{} {
+		return map[string]interface{}{
+			"operations": []interface{}{
+				map[string]interface{}{"mode": "set", "path": "reasoning_effort", "value": value},
+			},
+		}
+	}
+	tests := []struct {
+		name     string
+		input    string
+		override map[string]interface{}
+		want     string
+	}{
+		{
+			name:     "set effort creates reasoning object with summary",
+			input:    `{"model":"muse","input":[]}`,
+			override: setEffort("minimal"),
+			want:     `{"model":"muse","input":[],"reasoning":{"effort":"minimal","summary":"detailed"}}`,
+		},
+		{
+			name:     "set effort none does not add summary",
+			input:    `{"model":"mimo","input":[]}`,
+			override: setEffort("none"),
+			want:     `{"model":"mimo","input":[],"reasoning":{"effort":"none"}}`,
+		},
+		{
+			name:     "set effort keeps existing summary",
+			input:    `{"model":"muse","reasoning":{"effort":"xhigh","summary":"detailed"}}`,
+			override: setEffort("minimal"),
+			want:     `{"model":"muse","reasoning":{"effort":"minimal","summary":"detailed"}}`,
+		},
+		{
+			name:  "delete effort targets nested path",
+			input: `{"model":"muse","reasoning":{"effort":"xhigh","summary":"detailed"}}`,
+			override: map[string]interface{}{
+				"operations": []interface{}{
+					map[string]interface{}{"mode": "delete", "path": "reasoning_effort"},
+				},
+			},
+			want: `{"model":"muse","reasoning":{"summary":"detailed"}}`,
+		},
+		{
+			name:  "condition on chat path reads translated body path",
+			input: `{"model":"muse","reasoning":{"effort":"xhigh","summary":"detailed"}}`,
+			override: map[string]interface{}{
+				"operations": []interface{}{
+					map[string]interface{}{
+						"mode": "set", "path": "reasoning_effort", "value": "low",
+						"conditions": []interface{}{
+							map[string]interface{}{"mode": "full", "path": "reasoning_effort", "value": "xhigh"},
+						},
+					},
+				},
+			},
+			want: `{"model":"muse","reasoning":{"effort":"low","summary":"detailed"}}`,
+		},
+		{
+			name:     "legacy flat max_tokens maps to max_output_tokens",
+			input:    `{"model":"muse","max_output_tokens":32000}`,
+			override: map[string]interface{}{"max_tokens": 4096},
+			want:     `{"model":"muse","max_output_tokens":4096}`,
+		},
+		{
+			name:  "unmapped keys are left untouched",
+			input: `{"model":"muse"}`,
+			override: map[string]interface{}{
+				"operations": []interface{}{
+					map[string]interface{}{"mode": "set", "path": "temperature", "value": 0.2},
+				},
+			},
+			want: `{"model":"muse","temperature":0.2}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := &RelayInfo{ChannelMeta: &ChannelMeta{ParamOverride: tt.override, UpstreamModelName: "muse"}}
+			out, err := ApplyChatParamOverrideOnResponses([]byte(tt.input), info)
+			require.NoError(t, err)
+			require.JSONEq(t, tt.want, string(out))
+		})
+	}
+}
