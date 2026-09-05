@@ -185,7 +185,123 @@ func buildLegacyParamOverride(paramOverride map[string]interface{}) map[string]i
 }
 
 func ApplyParamOverrideWithRelayInfo(jsonData []byte, info *RelayInfo) ([]byte, error) {
-	paramOverride := getParamOverrideMap(info)
+	return applyParamOverrideMapWithRelayInfo(jsonData, info, getParamOverrideMap(info))
+}
+
+// chatParamPathsOnResponses：按 chat/completions 语义书写的规则路径在 Responses 请求体里的对应位置。
+// 只列有一一对应的顶层标量；thinking 之类 Responses 没有承载位的键不翻译，规则若命中会原样落到顶层。
+var chatParamPathsOnResponses = map[string]string{
+	"reasoning_effort":      "reasoning.effort",
+	"max_tokens":            "max_output_tokens",
+	"max_completion_tokens": "max_output_tokens",
+}
+
+// ApplyChatParamOverrideOnResponses 把按 chat/completions 语义书写的渠道规则应用到 Responses 请求体上。
+// 协议升级到 Responses 是网关单方面的行为，规则里的 reasoning_effort 等 chat 顶层键先改写成
+// Responses 的对应路径再应用，否则会原样落到顶层被上游判为未知参数。
+func ApplyChatParamOverrideOnResponses(jsonData []byte, info *RelayInfo) ([]byte, error) {
+	result, err := applyParamOverrideMapWithRelayInfo(jsonData, info, translateChatParamOverrideForResponses(getParamOverrideMap(info)))
+	if err != nil {
+		return nil, err
+	}
+	return syncResponsesReasoningSummary(result), nil
+}
+
+func translateChatParamOverrideForResponses(paramOverride map[string]interface{}) map[string]interface{} {
+	if len(paramOverride) == 0 {
+		return paramOverride
+	}
+	translated := make(map[string]interface{}, len(paramOverride))
+	for key, value := range paramOverride {
+		if !strings.EqualFold(strings.TrimSpace(key), "operations") {
+			translated[chatParamPathOnResponses(key)] = value
+			continue
+		}
+		var opMaps []map[string]interface{}
+		switch ops := value.(type) {
+		case []interface{}:
+			for _, op := range ops {
+				if opMap, ok := op.(map[string]interface{}); ok {
+					opMaps = append(opMaps, opMap)
+				}
+			}
+		case []map[string]interface{}:
+			opMaps = ops
+		}
+		if opMaps == nil {
+			translated[key] = value
+			continue
+		}
+		operations := make([]interface{}, 0, len(opMaps))
+		for _, opMap := range opMaps {
+			op := make(map[string]interface{}, len(opMap))
+			for k, v := range opMap {
+				op[k] = v
+			}
+			// set_header 的 path 是头名，不是请求体路径
+			if mode, _ := op["mode"].(string); mode != "set_header" {
+				for _, field := range []string{"path", "from"} {
+					if path, ok := op[field].(string); ok {
+						op[field] = chatParamPathOnResponses(path)
+					}
+				}
+			}
+			if conditions, ok := op["conditions"].([]interface{}); ok {
+				converted := make([]interface{}, 0, len(conditions))
+				for _, condition := range conditions {
+					condMap, ok := condition.(map[string]interface{})
+					if !ok {
+						converted = append(converted, condition)
+						continue
+					}
+					cond := make(map[string]interface{}, len(condMap))
+					for k, v := range condMap {
+						cond[k] = v
+					}
+					if path, ok := cond["path"].(string); ok {
+						cond["path"] = chatParamPathOnResponses(path)
+					}
+					converted = append(converted, cond)
+				}
+				op["conditions"] = converted
+			}
+			operations = append(operations, op)
+		}
+		translated[key] = operations
+	}
+	return translated
+}
+
+func chatParamPathOnResponses(path string) string {
+	if target, ok := chatParamPathsOnResponses[path]; ok {
+		return target
+	}
+	for chatKey, target := range chatParamPathsOnResponses {
+		if strings.HasPrefix(path, chatKey+".") {
+			return target + path[len(chatKey):]
+		}
+	}
+	return path
+}
+
+// syncResponsesReasoningSummary 与 reasoning.ApplyToOpenAIResponses 保持一致：规则写入 reasoning.effort
+// 而请求体原本没有 reasoning 对象时补 summary=detailed，否则上游不再回推理摘要、下游收不到 thinking 块。
+func syncResponsesReasoningSummary(data []byte) []byte {
+	effort := gjson.GetBytes(data, "reasoning.effort")
+	if !effort.Exists() || effort.Type != gjson.String || effort.String() == "" || effort.String() == string(kitreasoning.EffortNone) {
+		return data
+	}
+	if gjson.GetBytes(data, "reasoning.summary").Exists() {
+		return data
+	}
+	result, err := sjson.SetBytes(data, "reasoning.summary", "detailed")
+	if err != nil {
+		return data
+	}
+	return result
+}
+
+func applyParamOverrideMapWithRelayInfo(jsonData []byte, info *RelayInfo, paramOverride map[string]interface{}) ([]byte, error) {
 	if len(paramOverride) == 0 {
 		return jsonData, nil
 	}

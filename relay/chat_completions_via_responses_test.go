@@ -5,6 +5,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -136,9 +137,8 @@ func TestTextRequestViaResponsesConvertsClaudeToResponses(t *testing.T) {
 	require.Nil(t, apiErr)
 	require.NotNil(t, usage)
 	assert.Equal(t, 5, usage.TotalTokens)
-	// Claude 入站先归一化成 chat 请求再升级到 Responses，参数覆盖脚本才能按渠道原本的
-	// chat/completions 语义生效，故转换链是三段。
-	assert.Equal(t, []relaytypes.RelayFormat{relaytypes.RelayFormatClaude, relaytypes.RelayFormatOpenAI, relaytypes.RelayFormatOpenAIResponses}, info.RequestConversionChain)
+	// Claude 入站直转 Responses，不再绕 chat；参数覆盖改在 Responses 体上经键翻译后应用。
+	assert.Equal(t, []relaytypes.RelayFormat{relaytypes.RelayFormatClaude, relaytypes.RelayFormatOpenAIResponses}, info.RequestConversionChain)
 
 	upstream := <-captured
 	assert.Equal(t, "/v1/responses", upstream.path)
@@ -221,8 +221,9 @@ func newResponsesUpgradeServer(t *testing.T, captured chan<- []byte, capturedHea
 }
 
 // 参数覆盖脚本按渠道原本的 chat/completions 语义书写，协议升级到 Responses 是网关单方面的
-// 行为。Claude 入站必须和 OpenAI 入站一样先归一化成 chat 请求再套规则，否则 chat 语义的
-// reasoning_effort 会原样落到 Responses 请求顶层，被上游判为未知参数直接 400。
+// 行为。OpenAI 入站在 chat 体上套完规则再升级；Claude 入站直转 Responses，规则经 chat→Responses
+// 键翻译后落在 reasoning.effort 上。两种入站的出站体顶层都不能出现 chat 语义的 reasoning_effort，
+// 否则被上游判为未知参数直接 400。
 func TestTextRequestViaResponsesAppliesParamOverrideOnChatSemantics(t *testing.T) {
 	claudeRequest := &dto.ClaudeRequest{
 		Model:    "muse-spark-1.3",
@@ -245,7 +246,7 @@ func TestTextRequestViaResponsesAppliesParamOverrideOnChatSemantics(t *testing.T
 			format:    relaytypes.RelayFormatClaude,
 			path:      "/v1/messages",
 			request:   claudeRequest,
-			wantChain: []relaytypes.RelayFormat{relaytypes.RelayFormatClaude, relaytypes.RelayFormatOpenAI, relaytypes.RelayFormatOpenAIResponses},
+			wantChain: []relaytypes.RelayFormat{relaytypes.RelayFormatClaude, relaytypes.RelayFormatOpenAIResponses},
 		},
 		{
 			name:      "openai input",
@@ -327,4 +328,76 @@ func TestTextRequestViaResponsesFoldsOverriddenEffortIntoReasoning(t *testing.T)
 	reasoning, ok := upstreamBody["reasoning"].(map[string]any)
 	require.True(t, ok, "降档规则命中后应产生 Responses 的 reasoning 对象")
 	assert.Equal(t, "minimal", reasoning["effort"])
+	// 与绕道 chat 时转换器生成的 reasoning 对象一致：缺 summary 上游就不回推理摘要，下游收不到 thinking 块。
+	assert.Equal(t, "detailed", reasoning["summary"])
+	assert.NotContains(t, upstreamBody, "reasoning_effort")
+}
+
+// Claude 入站直转 Responses：历史里「思考 + 工具调用」的 assistant 轮不再产生空 assistant 占位，
+// tool_result 里的图片走 Responses 原生的 function_call_output + input_image，
+// 而不是绕 chat 时补丁 #8 的「占位 + 追加 user 消息」形式。
+func TestTextRequestViaResponsesConvertsClaudeDirectly(t *testing.T) {
+	const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+	captured := make(chan []byte, 1)
+	capturedHeader := make(chan string, 1)
+	server := newResponsesUpgradeServer(t, captured, capturedHeader)
+	defer server.Close()
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	request := &dto.ClaudeRequest{
+		Model: "muse-spark-1.3",
+		Messages: []dto.ClaudeMessage{
+			{Role: "user", Content: "take a screenshot"},
+			{Role: "assistant", Content: []map[string]any{
+				{"type": "thinking", "thinking": "look at the screen first", "signature": "sig"},
+				{"type": "tool_use", "id": "toolu_1", "name": "screenshot", "input": map[string]any{}},
+			}},
+			{Role: "user", Content: []map[string]any{
+				{"type": "tool_result", "tool_use_id": "toolu_1", "content": []map[string]any{
+					{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": png}},
+				}},
+			}},
+		},
+		Tools: []map[string]any{{"name": "screenshot", "description": "take a screenshot", "input_schema": map[string]any{"type": "object", "properties": map[string]any{}}}},
+	}
+	info := newResponsesUpgradeInfo(server.URL, relaytypes.RelayFormatClaude)
+	info.Request = request
+	adaptor := &openaichannel.Adaptor{}
+	adaptor.Init(info)
+
+	_, apiErr := textRequestViaResponses(c, info, adaptor, request)
+	require.Nil(t, apiErr)
+	assert.Equal(t, []relaytypes.RelayFormat{relaytypes.RelayFormatClaude, relaytypes.RelayFormatOpenAIResponses}, info.RequestConversionChain)
+
+	body := <-captured
+	var upstreamBody map[string]any
+	require.NoError(t, common.Unmarshal(body, &upstreamBody))
+	input, ok := upstreamBody["input"].([]any)
+	require.True(t, ok)
+
+	var kinds []string
+	var toolOutput []any
+	for _, item := range input {
+		entry, ok := item.(map[string]any)
+		require.True(t, ok)
+		kind, _ := entry["type"].(string)
+		if kind == "" {
+			kind = "message:" + entry["role"].(string)
+		}
+		kinds = append(kinds, kind)
+		if kind == "function_call_output" {
+			toolOutput, _ = entry["output"].([]any)
+		}
+	}
+	// 绕 chat 时这里会多出一条 {"role":"assistant","content":""} 占位
+	assert.Equal(t, []string{"message:user", "function_call", "function_call_output"}, kinds)
+	require.NotEmpty(t, toolOutput, "tool_result 应转成 function_call_output 的内容块数组")
+	assert.Equal(t, "input_image", toolOutput[0].(map[string]any)["type"])
+	assert.Equal(t, 1, strings.Count(string(body), png), "base64 只能出现在 input_image 里一次")
+	assert.NotEmpty(t, <-capturedHeader)
 }
