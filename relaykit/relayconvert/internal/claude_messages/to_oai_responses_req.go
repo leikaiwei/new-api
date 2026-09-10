@@ -276,6 +276,9 @@ func claudeToolChoiceToResponses(value any) (json.RawMessage, json.RawMessage, e
 	return toolChoice, parallelToolCalls, nil
 }
 
+// claudeToolResultToResponsesOutput 只产出 Responses output 接受的两种形状：字符串，或 input_text/input_image/input_file 数组。
+// 没有可转换块时（如 Claude Code ToolSearch 只回 tool_reference 块）序列化成文本，与 Claude→chat 路径一致；
+// 原样透传会被上游以 `input[N].output[0] did not match any supported type` 拒收。
 func claudeToolResultToResponsesOutput(content any) (any, error) {
 	if content == nil {
 		return "", nil
@@ -285,7 +288,7 @@ func claudeToolResultToResponsesOutput(content any) (any, error) {
 	}
 	blocks, err := kitutil.Any2Type[[]dto.ClaudeMediaMessage](content)
 	if err != nil {
-		return content, nil
+		return requestToJSONString(content), nil
 	}
 	parts := make([]map[string]any, 0, len(blocks))
 	for _, block := range blocks {
@@ -303,7 +306,7 @@ func claudeToolResultToResponsesOutput(content any) (any, error) {
 		}
 	}
 	if len(parts) == 0 {
-		return content, nil
+		return requestToJSONString(content), nil
 	}
 	return parts, nil
 }

@@ -219,6 +219,40 @@ func TestConvertRequestClaudeToResponsesPreservesMixedBlockOrder(t *testing.T) {
 	assert.Equal(t, "continue", inputContentText(t, input[5]))
 }
 
+// Claude Code 的 ToolSearch 在 tool_result 里只回 tool_reference 块。Responses 的 output 数组不认识这种块，
+// 原样透传会被上游以 `input[N].output[0] did not match any supported type` 拒收，须降级成文本。
+func TestConvertRequestClaudeToResponsesSerializesToolReferenceOnlyToolResult(t *testing.T) {
+	var req dto.ClaudeRequest
+	require.NoError(t, kitutil.Unmarshal([]byte(`{
+		"model": "gpt-test",
+		"messages": [
+			{"role": "assistant", "content": [{"type": "tool_use", "id": "call_1", "name": "ToolSearch", "input": {"query": "select:TaskCreate,TaskList"}}]},
+			{"role": "user", "content": [
+				{"type": "tool_result", "tool_use_id": "call_1", "content": [
+					{"type": "tool_reference", "tool_name": "TaskCreate"},
+					{"type": "tool_reference", "tool_name": "TaskList"}
+				]},
+				{"type": "text", "text": "Tool loaded."}
+			]}
+		]
+	}`), &req))
+	info := &convmeta.Values{ConversionChain: []types.RelayFormat{types.RelayFormatClaude}}
+
+	result, err := ConvertRequest(nil, info, types.RelayFormatOpenAIResponses, &req)
+	require.NoError(t, err)
+	responsesReq := result.Value.(*dto.OpenAIResponsesRequest)
+
+	var input []map[string]any
+	require.NoError(t, kitutil.Unmarshal(responsesReq.Input, &input))
+	require.Len(t, input, 3)
+	assert.Equal(t, "function_call_output", input[1]["type"])
+	assert.Equal(t, "call_1", input[1]["call_id"])
+	output, ok := input[1]["output"].(string)
+	require.True(t, ok, "output 必须是字符串，实际为 %T", input[1]["output"])
+	assert.JSONEq(t, `[{"type":"tool_reference","tool_name":"TaskCreate"},{"type":"tool_reference","tool_name":"TaskList"}]`, output)
+	assert.Equal(t, "Tool loaded.", inputContentText(t, input[2]))
+}
+
 func TestConvertRequestClaudeToResponsesDropsIncompatibleContextManagement(t *testing.T) {
 	req := &dto.ClaudeRequest{
 		Model: "gpt-test",
