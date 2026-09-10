@@ -118,6 +118,19 @@ Fork 自 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)，在上�
 - 回归：引擎级表驱动 7 例（新建 effort 补 summary / `none` 不补 / 已有 summary 保留 / `delete` 落到嵌套路径 / 条件路径同步翻译 / 旧式扁平 `max_tokens` / 未映射键原样）；relay 级 Claude / OpenAI 两种入站断言出站顶层不含 `reasoning_effort` 且 `set_header` 头在线；降档命中断言 `reasoning.effort=minimal` + `summary=detailed`；直转端到端断言出站 `input` 为 `[user, function_call, function_call_output]` 无空 assistant 占位、图片以 `input_image` 出现且 base64 只出现一次。**反证两组：换回 v1 实现后直转两例必失败；去掉键翻译后降档两例必失败（顶层直接出现 `reasoning_effort`）**，非静态推断
 - 上游状态：尚未反馈
 
+**#10 Claude→Responses 直转时，只含 `tool_reference` 块的 tool_result 被原样透传，上游 400** — `relaykit/relayconvert/internal/claude_messages/to_oai_responses_req.go`
+
+- 症状：Claude Code 调用过 ToolSearch（按需加载延迟工具）的会话，打到走 `chat_completions_to_responses_policy` 的 muse 渠道后每一轮都 400：``Error from provider (Console Go): Upstream request failed: [invalid_request_error] `input[N].output[0]` did not match any supported type``。对话历史只追加，这条 tool_result 一直在，重试无效，会话在 muse 上彻底卡死。生产 2026-09-07 15:44 至 09-10 22:40 共 13 条，全部落在 #33/#34，每条都直接返回客户端、无重试成功记录
+- 客户端没错：ToolSearch 的 tool_result 内容是 `[{"type":"tool_reference","tool_name":"TaskCreate"},…]`，Anthropic 官方文档「Custom tool search implementation」明确允许这种形状，由 API 端把引用展开成完整工具定义。而 Responses 的 `function_call_output.output` 只收字符串，或 `input_text` / `input_image` / `input_file` 数组
+- 根因：`claudeToolResultToResponsesOutput` 在块数组里一个可转换块都没有时（以及内容解析不成块数组时）`return content` 原样返回，Anthropic 专有块就进了 Responses 请求体。代码来自上游 [#7137](https://github.com/QuantumNous/new-api/pull/7137)，上游 main 截至 2026-09-10 未改
+- 为何 09-07 才暴露：补丁 #9 v2（2026-09-06）让 Claude 入站的 muse 流量改走直转。此前经 Claude→chat 转换，块数组在 `splitToolResultImages` 的无图片分支里整体序列化成 tool 消息文本，再转 Responses 时是字符串，上游接受（按代码推断，未用 v2 之前的流量实测）
+- 修复：两个兜底都改成序列化成 JSON 文本（复用同包的 `requestToJSONString`），与 Claude→chat 路径一致。序列化的是原始 `content`，`tool_name` 得以保留
+- 为何降级成文本不丢能力：转换 tools 时不看 `defer_loading`，出站 `tools` 已含全部延迟工具的完整定义（生产出站体实测 TaskCreate / TaskUpdate / TaskList 均在），`tool_reference` 在这里只是「已加载」标记
+- 影响面：仅 Claude 入站直转 Responses、且 tool_result 块数组里没有 text / image / document 的这一格。含可转换块的混合内容行为不变（不认识的块仍按原逻辑丢弃）
+- 回归：`relayconvert` 走生产入口 `ConvertRequest`，用线上同形状的请求 JSON 断言 `output` 为字符串且 `tool_name` 保留。**修复前该测试失败（`output` 为原样数组），非静态推断**；生产旧镜像上同形状探针复现 400（`input[2].output[0]`）
+- 已知遗留（本轮未修）：chat 路径的 `splitToolResultImages` 按 `ClaudeMediaMessage` 类型往返序列化，该结构体没有 `tool_name` 字段，出站 tool 消息只剩 `[{"type":"tool_reference"}]`。不报错、模型本就持有全部工具定义，故不在本补丁范围
+- 上游状态：尚未反馈
+
 **CI：fork 专用 GHCR 镜像构建** — `.github/workflows/fork-ghcr-release.yml`
 
 - 发布 release 时自动构建 amd64 + arm64 推送到 `ghcr.io/leikaiwei/new-api`，不走 Docker Hub
