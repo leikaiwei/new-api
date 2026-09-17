@@ -2,6 +2,8 @@
 
 Fork 自 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)，在上游基础上打了以下补丁：
 
+> 2026-09-17 同步上游至 `7209b6db9`（88 个提交）后逐个对照上游源码复查：#1–#3、#5–#10 修的缺陷在上游仍然存在，全部保留；#4 仍是唯一被上游吸收的。
+
 **#1 流式响应的上游 usage 被追加帧覆盖，导致 token 记账归零** — `relay/channel/openai/relay-openai.go`
 
 - 症状：Anthropic 入口（`/v1/messages`）+ OpenAI 兼容渠道 + 流式这个组合下，日志里 output token 与 cache token 恒为 0。生产实测 454/454 条流式请求全为 0，而同渠道非流式 239/239 正常，同入口走另一个上游端点也正常
@@ -122,7 +124,7 @@ Fork 自 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)，在上�
 
 - 症状：Claude Code 调用过 ToolSearch（按需加载延迟工具）的会话，打到走 `chat_completions_to_responses_policy` 的 muse 渠道后每一轮都 400：``Error from provider (Console Go): Upstream request failed: [invalid_request_error] `input[N].output[0]` did not match any supported type``。对话历史只追加，这条 tool_result 一直在，重试无效，会话在 muse 上彻底卡死。生产 2026-09-07 15:44 至 09-10 22:40 共 13 条，全部落在 #33/#34，每条都直接返回客户端、无重试成功记录
 - 客户端没错：ToolSearch 的 tool_result 内容是 `[{"type":"tool_reference","tool_name":"TaskCreate"},…]`，Anthropic 官方文档「Custom tool search implementation」明确允许这种形状，由 API 端把引用展开成完整工具定义。而 Responses 的 `function_call_output.output` 只收字符串，或 `input_text` / `input_image` / `input_file` 数组
-- 根因：`claudeToolResultToResponsesOutput` 在块数组里一个可转换块都没有时（以及内容解析不成块数组时）`return content` 原样返回，Anthropic 专有块就进了 Responses 请求体。代码来自上游 [#7137](https://github.com/QuantumNous/new-api/pull/7137)，上游 main 截至 2026-09-10 未改
+- 根因：`claudeToolResultToResponsesOutput` 在块数组里一个可转换块都没有时（以及内容解析不成块数组时）`return content` 原样返回，Anthropic 专有块就进了 Responses 请求体。代码来自上游 [#7137](https://github.com/QuantumNous/new-api/pull/7137)，上游 main 截至 2026-09-17 未改
 - 为何 09-07 才暴露：补丁 #9 v2（2026-09-06）让 Claude 入站的 muse 流量改走直转。此前经 Claude→chat 转换，块数组在 `splitToolResultImages` 的无图片分支里整体序列化成 tool 消息文本，再转 Responses 时是字符串，上游接受（按代码推断，未用 v2 之前的流量实测）
 - 修复：两个兜底都改成序列化成 JSON 文本（复用同包的 `requestToJSONString`），与 Claude→chat 路径一致。序列化的是原始 `content`，`tool_name` 得以保留
 - 为何降级成文本不丢能力：转换 tools 时不看 `defer_loading`，出站 `tools` 已含全部延迟工具的完整定义（生产出站体实测 TaskCreate / TaskUpdate / TaskList 均在），`tool_reference` 在这里只是「已加载」标记
